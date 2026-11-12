@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Toggle Ukishima's auto-hide by editing the same flags file the shell watches.
+#
+#   ukishima-autohide          toggle the pill auto-hide
+#   ukishima-autohide pill     toggle the pill auto-hide
+#   ukishima-autohide dock     toggle the dock auto-hide
+#
+# Ukishima's FileView watches flags.json with watchChanges, so a running shell
+# applies the change immediately. Editing the file instead of patching the QML
+# keeps the git checkout clean, so the in-app updater keeps working.
+set -u
+
+flags="${XDG_STATE_HOME:-$HOME/.local/state}/ukishima/flags.json"
+target="${1:-autoHide}"
+
+case "$target" in
+  autoHide | pill)
+    key=autoHide
+    label="Pill auto-hide"
+    ;;
+  dockAutoHide | dock)
+    key=dockAutoHide
+    label="Dock auto-hide"
+    ;;
+  *)
+    printf 'usage: ukishima-autohide [pill|dock]\n' >&2
+    exit 2
+    ;;
+esac
+
+mkdir -p "$(dirname -- "$flags")" || exit 1
+
+if [ ! -f "$flags" ]; then
+  # Ukishima's built-in default is on, so the first toggle turns it off.
+  printf '{"%s": false}\n' "$key" >"$flags" || exit 1
+else
+  tmp=$(mktemp -- "${flags}.XXXXXX") || exit 1
+  trap 'rm -f -- "$tmp"' EXIT
+  if ! jq --arg k "$key" \
+    'if has($k) then .[$k] = (.[$k] | not) else .[$k] = false end' \
+    "$flags" >"$tmp"; then
+    notify-send -a "Ukishima" -i dialog-error "Ukishima" \
+      "Could not read $flags" >/dev/null 2>&1 || true
+    exit 1
+  fi
+  chmod 644 "$tmp" 2>/dev/null || true
+  mv -f -- "$tmp" "$flags" || exit 1
+fi
+
+value=$(jq -r --arg k "$key" '.[$k] // false' "$flags" 2>/dev/null || printf false)
+if [ "$value" = true ]; then
+  state=enabled
+else
+  state=disabled
+fi
+
+notify-send -a "Ukishima" -i preferences-desktop "Ukishima" \
+  "$label $state" >/dev/null 2>&1 || true
+printf '%s %s\n' "$label" "$state"

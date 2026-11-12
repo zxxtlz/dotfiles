@@ -1,0 +1,21 @@
+# Editor / OS junk
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Hyprland writes timestamped backups next to edited configs
+*.bak.*
+*.bak
+
+# Shell-managed state (contains machine-specific paths)
+home/.config/fish/fish_variables
+
+# Never commit credentials or private state
+.git-credentials
+.netrc
+home/.ssh/
+home/.config/opencode/
+home/.config/keyrings/
+home/.local/share/keyrings/

@@ -1,0 +1,17 @@
+[Unit]
+Description=Clipboard history recorder (wl-paste --watch cliphist store)
+Documentation=https://github.com/sentriz/cliphist
+# Tied to the graphical session: starts with Hyprland (via UWSM's
+# graphical-session.target) and stops when the session ends. This is the
+# watcher the Ukishima shell's clipboard surface reads — without it,
+# `cliphist list` stays empty and the history never populates.
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/wl-paste --watch cliphist store
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,1508 @@
+#!/usr/bin/env python3
+"""Theme apps from the current wallpaper.
+
+The palette is extracted locally (no matugen/wallust dependency).  Wallpapers
+with no meaningful chroma (like the current black-and-white one) fall back to a
+neutral, slightly warm ramp instead of inventing a blue accent.
+
+Commands:
+    wallpaper-theme apply [image]   apply the palette once (default: current wallpaper)
+    wallpaper-theme watch           re-apply whenever the wallpaper changes
+    wallpaper-theme status          print the active palette
+"""
+from __future__ import annotations
+
+import colorsys
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config")
+XDG_CACHE = Path(os.environ.get("XDG_CACHE_HOME") or HOME / ".cache")
+XDG_DATA = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share")
+XDG_STATE = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local/state")
+
+CACHE = XDG_CACHE / "wallpaper-theme"
+PALETTE_FILE = CACHE / "palette.json"
+
+GTK_DIRS = [XDG_CONFIG / "gtk-3.0", XDG_CONFIG / "gtk-4.0"]
+KDE_FILE = XDG_CONFIG / "kdeglobals"
+KDE_SCHEME = XDG_DATA / "color-schemes" / "Wallpaper.colors"
+QT_DIR = XDG_CONFIG / "qt6ct"
+ROFI_DIR = XDG_CONFIG / "rofi"
+VESKTOP_DIR = XDG_CONFIG / "vesktop" / "settings"
+KITTY_DIR = XDG_CONFIG / "kitty"
+BTOP_DIR = XDG_CONFIG / "btop"
+HYPR_COLORS = XDG_CONFIG / "hypr" / "config" / "wallpaper-colors.lua"
+NOCTALIA_DIR = XDG_CONFIG / "noctalia"
+NOCTALIA_PALETTE = NOCTALIA_DIR / "palettes" / "Wallpaper.json"
+
+MARK_BEGIN = "/* >>> wallpaper-theme >>> */"
+MARK_END = "/* <<< wallpaper-theme <<< */"
+
+
+# ---------------------------------------------------------------------------
+# small helpers
+# ---------------------------------------------------------------------------
+
+def log(message: str) -> None:
+    print(f"wallpaper-theme: {message}", flush=True)
+
+
+def run(cmd: list[str], timeout: float = 8.0) -> tuple[int, str, str]:
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return result.returncode, result.stdout, result.stderr
+    except (OSError, subprocess.SubprocessError):
+        return 127, "", ""
+
+
+def read(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+def write(path: Path, content: str, mode: int | None = None) -> bool:
+    """Atomically write *content* when it differs from what is already there."""
+    old = read(path)
+    if old == content:
+        if mode is not None:
+            try:
+                path.chmod(mode)
+            except OSError:
+                pass
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    if mode is not None:
+        tmp.chmod(mode)
+    os.replace(tmp, path)
+    return True
+
+
+def tint(hue: float, sat: float, light: float) -> str:
+    r, g, b = colorsys.hls_to_rgb(
+        hue % 1.0,
+        max(0.0, min(1.0, light)),
+        max(0.0, min(1.0, sat)),
+    )
+    return "#%02x%02x%02x" % (round(r * 255), round(g * 255), round(b * 255))
+
+
+def lerp(x: float, x0: float, x1: float, y0: float, y1: float) -> float:
+    t = max(0.0, min(1.0, (x - x0) / (x1 - x0)))
+    return y0 + t * (y1 - y0)
+
+
+def rgb(hex_color: str) -> tuple[int, int, int]:
+    h = hex_color.lstrip("#")
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def csv(hex_color: str) -> str:
+    return ", ".join(str(v) for v in rgb(hex_color))
+
+
+def luminance(hex_color: str) -> float:
+    def channel(value: int) -> float:
+        c = value / 255
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+    r, g, b = rgb(hex_color)
+    return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+
+
+def contrast(a: str, b: str) -> float:
+    la, lb = luminance(a), luminance(b)
+    lo, hi = min(la, lb), max(la, lb)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def readable_on(color: str) -> str:
+    return "#111111" if contrast(color, "#111111") >= contrast(color, "#ffffff") else "#ffffff"
+
+
+def hypr(hex_color: str) -> str:
+    return f"rgba({hex_color.lstrip('#')}ff)"
+
+
+# ---------------------------------------------------------------------------
+# wallpaper discovery
+# ---------------------------------------------------------------------------
+
+def get_wallpaper(explicit: str | None = None) -> Path | None:
+    if explicit:
+        candidate = Path(explicit).expanduser()
+        if candidate.is_file():
+            return candidate
+
+    # Noctalia draws its own wallpaper layer over the compositor, so its
+    # effective path is authoritative while it is running.
+    if noctalia_running():
+        code, out, _ = run(["noctalia", "msg", "wallpaper-get"], timeout=3)
+        if code == 0:
+            for line in out.splitlines():
+                candidate = Path(line.strip()).expanduser()
+                if candidate.is_file():
+                    return candidate
+
+    code, out, _ = run(["awww", "query"], timeout=3)
+    if code == 0:
+        for line in out.splitlines():
+            match = re.search(r"currently displaying: image:\s*(.+?)\s*$", line)
+            if match:
+                candidate = Path(match.group(1)).expanduser()
+                if candidate.is_file():
+                    return candidate
+
+    for path in (
+        XDG_STATE / "ukishima" / "wallpaper",
+        XDG_CONFIG / "ukishima" / "wallpaper",
+    ):
+        value = read(path).strip()
+        if value:
+            candidate = Path(value).expanduser()
+            if candidate.is_file():
+                return candidate
+
+    # Noctalia keeps its wallpaper in settings.toml.
+    settings = read(XDG_STATE / "noctalia" / "settings.toml")
+    section = None
+    for line in settings.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped[1:-1]
+        elif section == "wallpaper.default":
+            match = re.match(r'path\s*=\s*"(.+)"', stripped)
+            if match:
+                candidate = Path(match.group(1)).expanduser()
+                if candidate.is_file():
+                    return candidate
+    return None
+
+
+# ---------------------------------------------------------------------------
+# palette extraction
+# ---------------------------------------------------------------------------
+
+def analyze_image(path: Path) -> dict:
+    """Return hue/saturation/mean-lightness for the dominant chromatic family.
+
+    The rule mirrors Ukishima's wallcolors.py: area-dominant chromatic hue (so a
+    small vivid spot cannot hijack the theme) and no chroma at all when the
+    image really is monochrome.
+    """
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            image = image.convert("RGB")
+            image.thumbnail((200, 200))
+            quantized = image.quantize(colors=48, method=Image.Quantize.MEDIANCUT)
+            palette = quantized.getpalette() or []
+            counts = quantized.getcolors() or []
+            total = sum(count for count, _ in counts)
+            buckets: dict[int, dict] = {}
+            weighted_light = 0.0
+            chromatic_pixels = 0
+
+            for count, index in counts:
+                pos = index * 3
+                if pos + 2 >= len(palette):
+                    continue
+                r, g, b = (palette[pos + i] / 255 for i in range(3))
+                h, l, s = colorsys.rgb_to_hls(r, g, b)
+                weighted_light += count * l
+                if s < 0.15 or l < 0.05 or l > 0.92:
+                    continue
+                chromatic_pixels += count
+                bucket = buckets.setdefault(int(h * 360) // 30 % 12, {"weight": 0.0, "best": None})
+                bucket["weight"] += count * s
+                score = count * s * (1.0 if 0.12 < l < 0.55 else 0.4)
+                if bucket["best"] is None or score > bucket["best"][0]:
+                    bucket["best"] = (score, h, s)
+
+            mean_light = weighted_light / total if total else 0.0
+            if not buckets or chromatic_pixels < 0.08 * total:
+                return {"hue": 0.09, "sat": 0.0, "mean_l": mean_light, "chromatic": False}
+
+            winner = max(buckets.values(), key=lambda item: item["weight"])
+            return {
+                "hue": winner["best"][1],
+                "sat": winner["best"][2],
+                "mean_l": mean_light,
+                "chromatic": True,
+            }
+    except Exception:
+        return {"hue": 0.09, "sat": 0.0, "mean_l": 0.08, "chromatic": False}
+
+
+def build_variant(analysis: dict, dark: bool) -> dict:
+    hue = analysis["hue"]
+    sat = analysis["sat"]
+    mean_l = analysis["mean_l"]
+    chromatic = analysis["chromatic"]
+
+    if dark:
+        base = lerp(mean_l, 0.0, 0.40, 0.045, 0.20)
+        steps = [0.0, 0.022, 0.038, 0.065, 0.100, 0.225]
+        surface_sat = min(max(sat, 0.30 if chromatic else 0.0), 0.45)
+        accent_sat = min(max(sat, 0.30) + 0.12, 0.82) if chromatic else 0.05
+        accent_l = 0.70
+        text = [(0.90, 0.05), (0.97, 0.03), (0.73, 0.07), (0.54, 0.06), (0.44, 0.05)]
+        text_bright_l, text_dim_l, text_faint_l = 0.97, 0.73, 0.54
+        outline_l = base + 0.35
+        alt_l = 0.86
+        container_l = 0.34
+    else:
+        base = 0.965
+        steps = [0.0, -0.035, -0.060, -0.090, -0.125, -0.300]
+        surface_sat = min(sat, 0.10)
+        accent_sat = min(sat + 0.05, 0.55) if chromatic else 0.05
+        accent_l = 0.42
+        text = [(0.13, 0.05), (0.07, 0.03), (0.30, 0.08), (0.44, 0.06), (0.54, 0.05)]
+        text_bright_l, text_dim_l, text_faint_l = 0.07, 0.30, 0.44
+        outline_l = 0.72
+        alt_l = 0.30
+        container_l = 0.82
+
+    names = [
+        "surface",
+        "surface_low",
+        "surface_container",
+        "surface_high",
+        "surface_highest",
+        "outline",
+    ]
+    d = {name: tint(hue, surface_sat, base + step) for name, step in zip(names, steps)}
+    d["dark"] = dark
+    d["accent"] = tint(hue, accent_sat, accent_l)
+    d["accent_alt"] = tint(hue, min(accent_sat + 0.08, 0.90), alt_l)
+    d["accent_container"] = tint(hue, min(accent_sat + 0.08, 0.90), container_l)
+    d["on_accent"] = readable_on(d["accent"])
+    d["on_accent_container"] = readable_on(d["accent_container"])
+    d["accent_dim"] = tint(hue, surface_sat, outline_l)
+    d["text"] = tint(hue, text[0][1], text[0][0])
+    d["text_bright"] = tint(hue, text[1][1], text[1][0])
+    d["text_dim"] = tint(hue, text[2][1], text[2][0])
+    d["text_faint"] = tint(hue, text[3][1], text[3][0])
+    d["text_icon"] = tint(hue, 0.07, 0.81 if dark else 0.25)
+    d["error"] = "#ffb4ab" if dark else "#ba1a1a"
+    d["on_error"] = "#690005" if dark else "#ffffff"
+
+    if dark:
+        normal = ["#262626", "#ff6b6b", "#8fd694", "#e6c77a",
+                  "#8ab4f8", "#d7a8ff", "#76d4d4", "#e7e6e4"]
+        bright = ["#5a5a5a", "#ff9a9a", "#b4e8b8", "#f4dca0",
+                  "#a9c8ff", "#e5c2ff", "#9ae6e6", "#ffffff"]
+    else:
+        normal = ["#3a3a3a", "#b3261e", "#2e7d32", "#8a6d00",
+                  "#1f5fa8", "#7b3fa0", "#006a6a", "#5f5f5f"]
+        bright = ["#666666", "#d93025", "#388e3c", "#a17f00",
+                  "#2b74c4", "#9250b8", "#008080", "#1e1c1a"]
+
+    d["terminal"] = {
+        "background": d["surface"],
+        "foreground": d["text"],
+        "cursor": d["accent"],
+        "cursor_text": d["on_accent"],
+        "selection_bg": d["accent_container"],
+        "selection_fg": d["on_accent_container"],
+        "normal": dict(zip(["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"], normal)),
+        "bright": dict(zip(["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"], bright)),
+    }
+    return d
+
+
+def build_palette(wallpaper: Path, analysis: dict) -> dict:
+    return {
+        "wallpaper": str(wallpaper),
+        "hue": analysis["hue"],
+        "sat": analysis["sat"],
+        "chromatic": analysis["chromatic"],
+        "mean_l": analysis["mean_l"],
+        "dark": build_variant(analysis, True),
+        "light": build_variant(analysis, False),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Noctalia palette + template sync
+# ---------------------------------------------------------------------------
+
+def noctalia_json(palette: dict) -> dict:
+    def variant(d: dict) -> dict:
+        return {
+            "primary": d["accent"],
+            "on_primary": d["on_accent"],
+            "secondary": d["accent_alt"],
+            "on_secondary": d["on_accent"],
+            "tertiary": d["accent_dim"],
+            "on_tertiary": d["text_bright"] if d["dark"] else "#ffffff",
+            "error": d["error"],
+            "on_error": d["on_error"],
+            "surface": d["surface"],
+            "on_surface": d["text"],
+            "surface_container": d["surface_container"],
+            "on_surface_variant": d["text_dim"],
+            "outline_variant": d["outline"],
+            "shadow": "#000000",
+            "hover": d["surface_high"],
+            "on_hover": d["text_bright"],
+            "terminal": {
+                "background": d["terminal"]["background"],
+                "foreground": d["terminal"]["foreground"],
+                "cursor": d["terminal"]["cursor"],
+                "cursor_text": d["terminal"]["cursor_text"],
+                "selection_bg": d["terminal"]["selection_bg"],
+                "selection_fg": d["terminal"]["selection_fg"],
+                "normal": d["terminal"]["normal"],
+                "bright": d["terminal"]["bright"],
+            },
+        }
+
+    return {"version": 2, "dark": variant(palette["dark"]), "light": variant(palette["light"])}
+
+
+def noctalia_running() -> bool:
+    code, _, _ = run(["pgrep", "-x", "noctalia"], timeout=2)
+    return code == 0
+
+
+def update_noctalia_config() -> None:
+    path = NOCTALIA_DIR / "config.toml"
+    text = read(path)
+    if not text:
+        return
+
+    theme_match = re.search(r"(?ms)^\[theme\]\s*$.*?(?=^\[|\Z)", text)
+    if theme_match:
+        block = theme_match.group(0)
+        new_block = re.sub(r'(?m)^source\s*=\s*".*?"\s*$', 'source = "custom"', block)
+        if "custom_palette" not in new_block:
+            new_block = re.sub(
+                r'(?m)^(source\s*=\s*"custom"\s*)$',
+                r'\1\ncustom_palette = "Wallpaper"',
+                new_block,
+                count=1,
+            )
+        text = text[:theme_match.start()] + new_block + text[theme_match.end():]
+    else:
+        text = text.rstrip() + '\n\n[theme]\nsource = "custom"\ncustom_palette = "Wallpaper"\n'
+    write(path, text)
+
+
+def sync_noctalia(palette: dict) -> None:
+    # Intentionally a no-op. Noctalia derives its own palette from the
+    # wallpaper (theme.source = "wallpaper", Material tonal scheme), which
+    # keeps its text/background contrast pairs readable. This function used
+    # to write palettes/Wallpaper.json and force source = "custom" through
+    # config.toml and `noctalia msg color-scheme-set custom Wallpaper`,
+    # flipping the shell off the wallpaper palette on every wallpaper
+    # change. Noctalia regenerates its colors by itself when the wallpaper
+    # changes; the other app theming below stays this script's job.
+    return
+
+
+# ---------------------------------------------------------------------------
+# GTK / KDE / Qt
+# ---------------------------------------------------------------------------
+
+def gtk_css(d: dict, extra_vars: bool = False) -> str:
+    lines = [
+        f"/* Generated by wallpaper-theme ({'dark' if d['dark'] else 'light'}). */",
+        f"@define-color accent_color {d['accent']};",
+        f"@define-color accent_bg_color {d['accent']};",
+        f"@define-color accent_fg_color {d['on_accent']};",
+        f"@define-color destructive_bg_color {d['error']};",
+        f"@define-color destructive_fg_color {d['on_error']};",
+        f"@define-color error_bg_color {d['error']};",
+        f"@define-color error_fg_color {d['on_error']};",
+        "",
+        f"@define-color window_bg_color {d['surface']};",
+        f"@define-color window_fg_color {d['text']};",
+        f"@define-color view_bg_color {d['surface']};",
+        f"@define-color view_fg_color {d['text']};",
+        f"@define-color theme_bg_color {d['surface']};",
+        f"@define-color theme_fg_color {d['text']};",
+        f"@define-color theme_base_color {d['surface']};",
+        f"@define-color theme_text_color {d['text']};",
+        f"@define-color theme_selected_bg_color {d['accent']};",
+        f"@define-color theme_selected_fg_color {d['on_accent']};",
+        f"@define-color headerbar_bg_color {d['surface_container']};",
+        f"@define-color headerbar_fg_color {d['text']};",
+        f"@define-color headerbar_backdrop_color {d['surface']};",
+        f"@define-color popover_bg_color {d['surface_container']};",
+        f"@define-color popover_fg_color {d['text']};",
+        f"@define-color card_bg_color {d['surface_container']};",
+        f"@define-color card_fg_color {d['text']};",
+        f"@define-color dialog_bg_color {d['surface']};",
+        f"@define-color dialog_fg_color {d['text']};",
+        f"@define-color overview_bg_color {d['surface_container']};",
+        f"@define-color overview_fg_color {d['text']};",
+        f"@define-color sidebar_bg_color {d['surface_container']};",
+        f"@define-color sidebar_fg_color {d['text']};",
+        f"@define-color sidebar_backdrop_color {d['surface']};",
+        f"@define-color sidebar_border_color {d['outline']};",
+        f"@define-color secondary_sidebar_bg_color {d['surface']};",
+        f"@define-color secondary_sidebar_fg_color {d['text']};",
+        f"@define-color insensitive_bg_color {d['surface_high']};",
+        f"@define-color insensitive_fg_color {d['text_faint']};",
+        f"@define-color borders {d['outline']};",
+        f"@define-color unfocused_borders {d['outline']};",
+        f"@define-color content_view_bg {d['surface']};",
+        f"@define-color placeholder_text_color {d['text_faint']};",
+        f"@define-color theme_unfocused_bg_color {d['surface']};",
+        f"@define-color theme_unfocused_fg_color {d['text']};",
+        f"@define-color theme_unfocused_base_color {d['surface']};",
+        f"@define-color theme_unfocused_text_color {d['text']};",
+        f"@define-color theme_unfocused_selected_bg_color {d['accent']};",
+        f"@define-color theme_unfocused_selected_fg_color {d['on_accent']};",
+        "",
+        "/* Accent details that named colours alone do not reach. */",
+        "headerbar { border-color: @borders; }",
+        "entry:focus, spinbutton:focus, button:focus-visible {",
+        "    outline-color: @accent_bg_color;",
+        "}",
+        "progressbar > trough > progress {",
+        "    background-color: @accent_bg_color;",
+        "}",
+        "checkbutton check:checked, radiobutton radio:checked {",
+        "    background-color: @accent_bg_color;",
+        "    color: @accent_fg_color;",
+        "}",
+        "",
+    ]
+    if extra_vars:
+        # libadwaita reads CSS custom properties, which plain @define-color
+        # does not replace. This keeps its accent from staying on Noctalia's
+        # old value until the next template run.
+        lines += [
+            ":root {",
+            f"    --accent-color: {d['accent']};",
+            f"    --accent-bg-color: {d['accent']};",
+            f"    --accent-fg-color: {d['on_accent']};",
+            "}",
+            "",
+        ]
+    return "\n".join(lines)
+
+
+def ensure_gtk_imports(directory: Path) -> None:
+    gtk_css_path = directory / "gtk.css"
+    text = read(gtk_css_path)
+    if "noctalia.css" not in text:
+        text = '@import url("noctalia.css");\n' + text
+    if 'wallpaper.css' not in text:
+        text = text.rstrip() + '\n@import url("wallpaper.css");\n'
+    write(gtk_css_path, text)
+
+
+def kde_color_sections(d: dict) -> str:
+    scheme = {
+        "Colors:Button": {
+            "BackgroundAlternate": d["surface_high"],
+            "BackgroundNormal": d["surface_container"],
+            "ForegroundNormal": d["text"],
+            "ForegroundInactive": d["text_dim"],
+            "ForegroundActive": d["accent"],
+            "ForegroundLink": d["accent"],
+            "ForegroundVisited": d["accent_dim"],
+            "ForegroundNegative": d["error"],
+            "ForegroundNeutral": d["accent_alt"],
+            "ForegroundPositive": d["accent_alt"],
+            "DecorationFocus": d["accent"],
+            "DecorationHover": d["accent"],
+        },
+        "Colors:Complementary": {
+            "BackgroundAlternate": d["surface_high"],
+            "BackgroundNormal": d["surface"],
+            "ForegroundNormal": d["text"],
+            "ForegroundInactive": d["text_dim"],
+            "ForegroundActive": d["accent"],
+            "ForegroundLink": d["accent"],
+            "ForegroundVisited": d["accent_dim"],
+            "ForegroundNegative": d["error"],
+            "ForegroundNeutral": d["accent_alt"],
+            "ForegroundPositive": d["accent_alt"],
+            "DecorationFocus": d["accent"],
+            "DecorationHover": d["accent"],
+        },
+        "Colors:Header": {
+            "BackgroundAlternate": d["surface"],
+            "BackgroundNormal": d["surface_container"],
+            "ForegroundNormal": d["text"],
+            "ForegroundInactive": d["text_dim"],
+            "ForegroundActive": d["accent"],
+            "ForegroundLink": d["accent"],
+            "ForegroundVisited": d["accent_dim"],
+            "ForegroundNegative": d["error"],
+            "ForegroundNeutral": d["accent_alt"],
+            "ForegroundPositive": d["accent_alt"],
+            "DecorationFocus": d["accent"],
+            "DecorationHover": d["accent"],
+        },
+        "Colors:Header][Inactive": {
+            "BackgroundAlternate": d["surface_container"],
+            "BackgroundNormal": d["surface"],
+            "ForegroundNormal": d["text"],
+            "ForegroundInactive": d["text_dim"],
+            "ForegroundActive": d["accent"],
+            "ForegroundLink": d["accent"],
+            "ForegroundVisited": d["accent_dim"],
+            "ForegroundNegative": d["error"],
+            "ForegroundNeutral": d["accent_alt"],
+            "ForegroundPositive": d["accent_alt"],
+            "DecorationFocus": d["accent"],
+            "DecorationHover": d["accent"],
+        },
+        "Colors:Selection": {
+            "BackgroundAlternate": d["surface_high"],
+            "BackgroundNormal": d["accent"],
+            "ForegroundNormal": d["on_accent"],
+            "ForegroundInactive": d["text_dim"],
+            "ForegroundActive": d["on_accent"],
+            "ForegroundLink": d["accent"],
+            "ForegroundVisited": d["on_accent"],
+            "ForegroundNegative": d["on_error"],
+            "ForegroundNeutral": d["on_accent"],
+            "ForegroundPositive": d["on_accent"],
+            "DecorationFocus": d["accent"],
+            "DecorationHover": d["accent"],
+        },
+        "Colors:Tooltip": {
+            "BackgroundAlternate": d["surface"],
+            "BackgroundNormal": d["surface_container"],
+            "ForegroundNormal": d["text_bright"],
+            "ForegroundInactive": d["text_dim"],
+            "ForegroundActive": d["accent"],
+            "ForegroundLink": d["accent"],
+            "ForegroundVisited": d["accent_dim"],
+            "ForegroundNegative": d["error"],
+            "ForegroundNeutral": d["accent_alt"],
+            "ForegroundPositive": d["accent_alt"],
+            "DecorationFocus": d["accent"],
+            "DecorationHover": d["accent"],
+        },
+        "Colors:View": {
+            "BackgroundAlternate": d["surface_container"],
+            "BackgroundNormal": d["surface"],
+            "ForegroundNormal": d["text"],
+            "ForegroundInactive": d["text_dim"],
+            "ForegroundActive": d["accent"],
+            "ForegroundLink": d["accent"],
+            "ForegroundVisited": d["accent_dim"],
+            "ForegroundNegative": d["error"],
+            "ForegroundNeutral": d["accent_alt"],
+            "ForegroundPositive": d["accent_alt"],
+            "DecorationFocus": d["accent"],
+            "DecorationHover": d["accent"],
+        },
+        "Colors:Window": {
+            "BackgroundAlternate": d["accent_container"],
+            "BackgroundNormal": d["surface_container"],
+            "ForegroundNormal": d["text"],
+            "ForegroundInactive": d["text_dim"],
+            "ForegroundActive": d["accent"],
+            "ForegroundLink": d["accent"],
+            "ForegroundVisited": d["accent_dim"],
+            "ForegroundNegative": d["error"],
+            "ForegroundNeutral": d["accent_alt"],
+            "ForegroundPositive": d["accent_alt"],
+            "DecorationFocus": d["accent"],
+            "DecorationHover": d["accent"],
+        },
+    }
+
+    out = [
+        "[ColorEffects:Disabled]",
+        f"Color={csv(d['surface'])}",
+        "ColorAmount=0",
+        "ColorEffect=0",
+        "ContrastAmount=0.65",
+        "ContrastEffect=1",
+        "IntensityAmount=0.1",
+        "IntensityEffect=2",
+        "",
+        "[ColorEffects:Inactive]",
+        "ChangeSelectionColor=true",
+        f"Color={csv(d['outline'])}",
+        "ColorAmount=0.025",
+        "ColorEffect=2",
+        "ContrastAmount=0.1",
+        "ContrastEffect=2",
+        "Enable=false",
+        "IntensityAmount=0",
+        "IntensityEffect=0",
+        "",
+    ]
+
+    for section, values in scheme.items():
+        out.append(f"[{section}]")
+        for key, value in values.items():
+            out.append(f"{key}={csv(value)}")
+        out.append("")
+
+    out += [
+        "[WM]",
+        f"activeBackground={csv(d['accent_container'])}",
+        f"activeBlend={csv(d['on_accent_container'])}",
+        f"activeForeground={csv(d['on_accent_container'])}",
+        f"inactiveBackground={csv(d['surface'])}",
+        f"inactiveBlend={csv(d['text_dim'])}",
+        f"inactiveForeground={csv(d['text_dim'])}",
+        "",
+    ]
+    return "\n".join(out)
+
+
+def parse_ini(text: str) -> list[tuple[str, list[str]]]:
+    sections: list[tuple[str, list[str]]] = []
+    current: tuple[str, list[str]] | None = None
+    for line in text.splitlines():
+        if line.startswith("[") and line.endswith("]"):
+            current = (line[1:-1], [])
+            sections.append(current)
+        elif current is not None:
+            current[1].append(line)
+    return sections
+
+
+def write_kde(palette: dict) -> None:
+    d = palette["dark"]
+    write(
+        KDE_SCHEME,
+        "[KDE]\ncontrast=4\n\n[General]\nColorScheme=Wallpaper\nName=Wallpaper\n\n"
+        + kde_color_sections(d),
+    )
+
+    existing = read(KDE_FILE)
+    general_extra: list[str] = []
+    preserved: list[tuple[str, list[str]]] = []
+    for name, lines in parse_ini(existing):
+        if name == "General":
+            for line in lines:
+                if not re.match(r"\s*(ColorScheme|Name)\s*=", line):
+                    general_extra.append(line)
+        elif name == "KDE" or name.startswith("Colors:") or name == "WM" or name.startswith("ColorEffects:"):
+            continue
+        else:
+            preserved.append((name, lines))
+
+    out = ["[General]", "ColorScheme=Wallpaper", "Name=Wallpaper"]
+    out += [line for line in general_extra if line.strip()]
+    out.append("")
+    out.append("[KDE]")
+    out.append("contrast=4")
+    out.append("")
+    for name, lines in preserved:
+        out.append(f"[{name}]")
+        out.extend(lines)
+        out.append("")
+    out.append(kde_color_sections(d))
+    write(KDE_FILE, "\n".join(out))
+
+
+def qt_color_line(d: dict) -> str:
+    colors = [
+        d["text"],             # windowText
+        d["surface_container"],  # button
+        "#ffffff",             # light
+        "#cacaca",             # midlight
+        "#9f9f9f",             # dark
+        "#b8b8b8",             # mid
+        d["text"],             # text
+        "#ffffff",             # brightText
+        d["text"],             # buttonText
+        d["surface"],          # base
+        d["surface"],          # window
+        "#000000",             # shadow
+        d["accent_container"], # highlight
+        d["on_accent_container"],  # highlightedText
+        d["accent"],           # link
+        d["accent_dim"],       # linkVisited
+        d["surface_low"],      # alternateBase
+        d["surface_low"],      # NoRole
+        d["surface_container"],  # toolTipBase
+        d["text"],             # toolTipText
+        d["text_faint"],       # placeholderText
+        d["accent"],           # accent
+    ]
+    return ", ".join(colors)
+
+
+def write_qt(palette: dict) -> None:
+    d = palette["dark"]
+    color_line = qt_color_line(d)
+    content = (
+        "[ColorScheme]\n"
+        "# Generated by wallpaper-theme\n"
+        "active_colors=" + color_line + "\n"
+        "disabled_colors=" + color_line + "\n"
+        "inactive_colors=" + color_line + "\n"
+    )
+    target = QT_DIR / "colors" / "wallpaper.conf"
+    write(target, content)
+
+    conf_path = QT_DIR / "qt6ct.conf"
+    conf = read(conf_path)
+    if not conf:
+        conf = "[Appearance]\n"
+    lines = conf.splitlines()
+    seen_path = seen_custom = False
+    for i, line in enumerate(lines):
+        if line.startswith("color_scheme_path="):
+            lines[i] = f"color_scheme_path={target}"
+            seen_path = True
+        elif line.startswith("custom_palette="):
+            lines[i] = "custom_palette=true"
+            seen_custom = True
+    if not seen_path:
+        lines.append(f"color_scheme_path={target}")
+    if not seen_custom:
+        lines.append("custom_palette=true")
+    write(conf_path, "\n".join(lines).rstrip() + "\n")
+
+
+def write_legacy_noctalia(palette: dict) -> None:
+    """Keep the files Noctalia wrote before the switch from staying blue.
+
+    Noctalia regenerates these from the active palette the next time it runs,
+    but apps read them immediately, so mirror the wallpaper palette now.
+    """
+    d = palette["dark"]
+    write(
+        XDG_DATA / "color-schemes" / "noctalia.colors",
+        "[KDE]\ncontrast=4\n\n[General]\nColorScheme=noctalia\nName=noctalia\n\n"
+        + kde_color_sections(d),
+    )
+
+    color_line = qt_color_line(d)
+    write(
+        QT_DIR / "colors" / "noctalia.conf",
+        "[ColorScheme]\n# Generated by wallpaper-theme; kept in sync with the wallpaper palette.\n"
+        "active_colors=" + color_line + "\n"
+        "disabled_colors=" + color_line + "\n"
+        "inactive_colors=" + color_line + "\n",
+    )
+
+    # KDE apps can override the global scheme per app; Dolphin does.
+    rc = XDG_CONFIG / "dolphinrc"
+    text = read(rc)
+    if text and re.search(r"(?m)^\s*ColorScheme\s*=", text):
+        write(rc, re.sub(r"(?m)^(\s*ColorScheme\s*=\s*).*$", r"\1Wallpaper", text))
+
+
+# ---------------------------------------------------------------------------
+# rofi
+# ---------------------------------------------------------------------------
+
+def rofi_theme(d: dict) -> str:
+    return f"""/* Generated by wallpaper-theme. */
+
+* {{
+    font:            "Adwaita Sans 11";
+    background-color: transparent;
+    text-color:      {d['text']};
+    border:          0px;
+    margin:          0px;
+    padding:         0px;
+    spacing:         0px;
+
+    /* Replace rofi's built-in Solarized palette variables so no default
+       light colours leak into alternating rows or mode buttons. */
+    background:                    {d['surface']};
+    foreground:                    {d['text']};
+    lightbg:                       {d['surface_high']};
+    lightfg:                       {d['text_dim']};
+    normal-background:             transparent;
+    normal-foreground:             {d['text']};
+    alternate-normal-background:   transparent;
+    alternate-normal-foreground:   {d['text']};
+    selected-normal-background:    {d['accent']};
+    selected-normal-foreground:    {d['on_accent']};
+    active-background:             {d['surface_high']};
+    active-foreground:             {d['text']};
+    selected-active-background:    {d['accent']};
+    selected-active-foreground:    {d['on_accent']};
+    alternate-active-background:   transparent;
+    alternate-active-foreground:   {d['text']};
+    urgent-background:             {d['error']};
+    urgent-foreground:             {d['on_error']};
+    selected-urgent-background:    {d['error']};
+    selected-urgent-foreground:    {d['on_error']};
+    alternate-urgent-background:   transparent;
+    alternate-urgent-foreground:   {d['text']};
+    separatorcolor:                {d['outline']};
+}}
+
+window {{
+    width:            700px;
+    location:         center;
+    anchor:           center;
+    border:           1px;
+    border-color:     {d['accent']}66;
+    border-radius:    20px;
+    background-color: {d['surface']}f7;
+    padding:          16px;
+}}
+
+mainbox {{
+    spacing: 12px;
+}}
+
+inputbar {{
+    background-color: {d['surface_container']};
+    border:           1px;
+    border-color:     {d['outline']};
+    border-radius:    14px;
+    padding:          14px 18px;
+    spacing:          14px;
+    children:         [ prompt, entry ];
+}}
+
+prompt {{
+    text-color: {d['accent']};
+    font:       "Adwaita Sans Bold 13";
+}}
+
+entry {{
+    text-color:         {d['text']};
+    placeholder:        "Search applications…";
+    placeholder-color:  {d['text_faint']};
+    cursor:             text;
+}}
+
+listview {{
+    columns:          1;
+    lines:            8;
+    spacing:          4px;
+    scrollbar:        false;
+    fixed-height:     false;
+    background-color: transparent;
+    border:           0px;
+}}
+
+element {{
+    padding:       11px 14px;
+    border-radius: 12px;
+    spacing:       14px;
+}}
+
+element normal.normal,
+element alternate.normal {{
+    background-color: transparent;
+    text-color:       {d['text']};
+}}
+
+element normal.urgent,
+element alternate.urgent {{
+    background-color: {d['error']};
+    text-color:       {d['on_error']};
+}}
+
+element normal.active,
+element alternate.active {{
+    background-color: {d['surface_high']};
+    text-color:       {d['text']};
+}}
+
+element selected.normal,
+element selected.active,
+element selected.urgent {{
+    background-color: {d['accent']};
+    text-color:       {d['on_accent']};
+}}
+
+element-icon {{
+    size:         28px;
+    border-radius: 7px;
+}}
+
+element-text {{
+    vertical-align: 0.5;
+    text-color:    inherit;
+}}
+
+mode-switcher {{
+    spacing: 6px;
+}}
+
+button {{
+    background-color: {d['surface_container']};
+    text-color:       {d['text_dim']};
+    border:           0px;
+    border-radius:    10px;
+    padding:          9px 14px;
+}}
+
+button selected {{
+    background-color: {d['accent']};
+    text-color:       {d['on_accent']};
+}}
+
+scrollbar {{
+    width:        6px;
+    handle-color: {d['outline']};
+    handle-width: 6px;
+}}
+
+error-message {{
+    background-color: {d['error']};
+    text-color:       {d['on_error']};
+    border-radius:    10px;
+    padding:          8px 12px;
+}}
+"""
+
+
+def rofi_config() -> str:
+    return """/* Generated by wallpaper-theme. */
+configuration {
+    modi:                "drun,run,window";
+    show-icons:          true;
+    icon-theme:          "breeze-dark";
+    display-drun:        "Applications";
+    display-run:         "Commands";
+    display-window:      "Windows";
+    drun-display-format: "{name}";
+    window-format:       "{w}  ·  {t}";
+    matching:            "fuzzy";
+    sort:                true;
+    case-smart:          true;
+    show-match:          true;
+    terminal:            "kitty";
+    font:                "Adwaita Sans 11";
+}
+
+@import "wallpaper.rasi"
+"""
+
+
+def write_rofi(palette: dict) -> None:
+    write(ROFI_DIR / "wallpaper.rasi", rofi_theme(palette["dark"]))
+    write(ROFI_DIR / "config.rasi", rofi_config())
+
+
+# ---------------------------------------------------------------------------
+# Vesktop / Discord
+# ---------------------------------------------------------------------------
+
+def vesktop_css(d: dict) -> str:
+    def alpha(h: str, a: float) -> str:
+        r, g, b = rgb(h)
+        return f"rgba({r}, {g}, {b}, {a:.2f})"
+
+    return f"""{MARK_BEGIN}
+:root {{
+    --background-primary: {d['surface']};
+    --background-secondary: {d['surface_low']};
+    --background-secondary-alt: {d['surface']};
+    --background-tertiary: {d['surface_container']};
+    --background-accent: {d['surface_high']};
+    --background-floating: {d['surface_container']};
+    --background-base-lowest: {d['surface']};
+    --background-base-low: {d['surface_low']};
+    --background-base-lower: {d['surface_low']};
+    --background-base: {d['surface_container']};
+    --background-base-high: {d['surface_high']};
+    --background-base-highest: {d['surface_highest']};
+
+    --background-modifier-hover: {alpha(d['accent'], 0.10)};
+    --background-modifier-active: {alpha(d['accent'], 0.16)};
+    --background-modifier-selected: {alpha(d['accent'], 0.22)};
+    --background-modifier-accent: {alpha(d['outline'], 0.55)};
+    --background-mentioned: {alpha(d['accent'], 0.08)};
+    --background-mentioned-hover: {alpha(d['accent'], 0.14)};
+
+    --header-primary: {d['text_bright']};
+    --header-secondary: {d['text_dim']};
+    --text-normal: {d['text']};
+    --text-muted: {d['text_dim']};
+    --text-link: {d['accent']};
+    --text-strong: {d['text_bright']};
+    --text-default: {d['text']};
+
+    --interactive-normal: {d['text_dim']};
+    --interactive-hover: {d['text']};
+    --interactive-active: {d['text_bright']};
+    --interactive-muted: {d['text_faint']};
+
+    --brand-experiment: {d['accent']};
+    --brand-360: {d['accent_alt']};
+    --brand-400: {d['accent_alt']};
+    --brand-500: {d['accent']};
+    --brand-560: {d['accent_dim']};
+    --brand-600: {d['accent_dim']};
+    --brand-700: {d['outline']};
+    --focus-primary: {d['accent']};
+    --mention-foreground: {d['accent']};
+    --mention-background: {alpha(d['accent'], 0.12)};
+
+    --status-positive: #7bd88f;
+    --status-warning: #e6c77a;
+    --status-danger: {d['error']};
+    --status-idle: #e6c77a;
+    --status-offline: {d['text_faint']};
+
+    --button-positive-background: {d['accent']};
+    --button-positive-background-hover: {d['accent_alt']};
+    --button-danger-background: {d['error']};
+    --button-danger-background-hover: #ff8f85;
+    --button-secondary-background: {d['surface_high']};
+    --button-secondary-background-hover: {d['surface_highest']};
+}}
+{MARK_END}
+"""
+
+
+def replace_marked(path: Path, block: str) -> None:
+    old = read(path)
+    if MARK_BEGIN in old and MARK_END in old:
+        pattern = re.compile(
+            re.escape(MARK_BEGIN) + r".*?" + re.escape(MARK_END) + r"\n?",
+            re.DOTALL,
+        )
+        new = pattern.sub(block, old)
+    else:
+        new = (old.rstrip() + "\n\n" if old.strip() else "") + block
+    write(path, new)
+
+
+def write_vesktop(palette: dict) -> None:
+    settings_path = VESKTOP_DIR / "settings.json"
+    try:
+        settings = json.loads(read(settings_path) or "{}")
+    except json.JSONDecodeError:
+        settings = {}
+    if settings.get("useQuickCss") is not True:
+        settings["useQuickCss"] = True
+        write(settings_path, json.dumps(settings, indent=4) + "\n")
+    replace_marked(VESKTOP_DIR / "quickCss.css", vesktop_css(palette["dark"]))
+
+
+# ---------------------------------------------------------------------------
+# LibreWolf
+# ---------------------------------------------------------------------------
+
+def librewolf_profile() -> Path | None:
+    root = XDG_CONFIG / "librewolf" / "librewolf"
+    if not root.is_dir():
+        return None
+
+    # profiles.ini has two kinds of "Default": one under [Install...] naming the
+    # default profile path, and "Default=1" flagging the default [ProfileN].
+    default = None
+    profiles: dict[str, dict[str, str]] = {}
+    install_default = None
+    section = ""
+    for line in read(root / "profiles.ini").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped[1:-1]
+            if section.startswith("Profile"):
+                profiles.setdefault(section, {})
+            continue
+        match = re.match(r"([A-Za-z0-9_]+)\s*=\s*(.*?)\s*$", stripped)
+        if not match:
+            continue
+        key, value = match.group(1), match.group(2)
+        if section.startswith("Install") and key == "Default":
+            install_default = value
+        elif section.startswith("Profile"):
+            profiles[section][key] = value
+        elif section == "General" and key == "Default":
+            default = value
+
+    for name, data in profiles.items():
+        if data.get("Default") == "1" and data.get("Path"):
+            default = data["Path"]
+    if install_default:
+        default = install_default
+    if default and (root / default).is_dir():
+        return root / default
+
+    candidates = [p for p in root.iterdir() if p.is_dir() and (p / "prefs.js").is_file()]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: (p / "prefs.js").stat().st_mtime)
+
+
+def librewolf_chrome(d: dict) -> str:
+    return f"""/* Generated by wallpaper-theme. */
+
+:root {{
+    --lwt-accent-color: {d['surface']} !important;
+    --lwt-text-color: {d['text']} !important;
+    --toolbar-bgcolor: {d['surface_container']} !important;
+    --toolbar-color: {d['text']} !important;
+    --tab-selected-bgcolor: {d['surface_container']} !important;
+    --tab-selected-textcolor: {d['text_bright']} !important;
+    --tab-line-color: {d['accent']} !important;
+    --lwt-tab-line-color: {d['accent']} !important;
+    --toolbarbutton-icon-fill: {d['text']} !important;
+    --toolbarbutton-hover-background: {d['accent']}1f !important;
+    --toolbarbutton-active-background: {d['accent']}38 !important;
+    --urlbar-box-bgcolor: {d['surface_container']} !important;
+    --urlbar-box-focus-bgcolor: {d['surface_high']} !important;
+    --urlbar-box-text-color: {d['text']} !important;
+    --focus-outline-color: {d['accent']} !important;
+    --arrowpanel-background: {d['surface_container']} !important;
+    --arrowpanel-color: {d['text']} !important;
+    --arrowpanel-border-color: {d['outline']} !important;
+    --lwt-sidebar-background-color: {d['surface']} !important;
+    --lwt-sidebar-text-color: {d['text']} !important;
+    --lwt-sidebar-highlight-background-color: {d['accent']} !important;
+    --lwt-sidebar-highlight-text-color: {d['on_accent']} !important;
+    --newtab-background-color: {d['surface']} !important;
+    --newtab-text-primary-color: {d['text']} !important;
+}}
+
+#navigator-toolbox {{
+    background-color: {d['surface']} !important;
+    border-bottom: 1px solid {d['outline']} !important;
+}}
+
+#TabsToolbar, #PersonalToolbar {{
+    background-color: {d['surface_low']} !important;
+}}
+
+.tabbrowser-tab[selected="true"] {{
+    box-shadow: inset 0 2px 0 {d['accent']} !important;
+}}
+
+#urlbar-background, #searchbar {{
+    background-color: {d['surface_container']} !important;
+    border: 1px solid {d['outline']} !important;
+}}
+
+#urlbar[focused="true"] > #urlbar-background {{
+    border-color: {d['accent']} !important;
+    box-shadow: 0 0 0 2px {d['accent']}38 !important;
+}}
+
+toolbarbutton:hover, .toolbarbutton-1:hover {{
+    background-color: {d['accent']}1f !important;
+}}
+
+#sidebar-header {{
+    background-color: {d['surface_low']} !important;
+    color: {d['text']} !important;
+    border-color: {d['outline']} !important;
+}}
+
+#sidebar-box, #sidebar {{
+    background-color: {d['surface']} !important;
+}}
+
+findbar {{
+    background-color: {d['surface_container']} !important;
+    color: {d['text']} !important;
+    border-top: 1px solid {d['outline']} !important;
+}}
+
+menupopup, panel {{
+    --panel-background: {d['surface_container']} !important;
+    --panel-color: {d['text']} !important;
+    --panel-border-color: {d['outline']} !important;
+}}
+
+#statuspanel-label {{
+    background-color: {d['surface_container']} !important;
+    color: {d['text']} !important;
+    border-color: {d['outline']} !important;
+}}
+"""
+
+
+def librewolf_content(d: dict) -> str:
+    return f"""/* Generated by wallpaper-theme. */
+
+:root {{
+    scrollbar-color: {d['outline']} {d['surface']};
+}}
+
+@-moz-document url("about:blank"), url("about:newtab"), url("about:home") {{
+    html, body {{
+        background-color: {d['surface']} !important;
+        color: {d['text']} !important;
+    }}
+}}
+"""
+
+
+def write_librewolf(palette: dict) -> None:
+    profile = librewolf_profile()
+    if not profile:
+        return
+    chrome = profile / "chrome"
+    chrome.mkdir(parents=True, exist_ok=True)
+    write(chrome / "wallpaper-theme.css", librewolf_chrome(palette["dark"]))
+    write(chrome / "wallpaper-content.css", librewolf_content(palette["dark"]))
+
+    user_chrome = chrome / "userChrome.css"
+    text = read(user_chrome)
+    if "wallpaper-theme.css" not in text:
+        text = '@import url("wallpaper-theme.css");\n' + (("\n" + text) if text.strip() else "")
+        write(user_chrome, text)
+
+    user_content = chrome / "userContent.css"
+    text = read(user_content)
+    if "wallpaper-content.css" not in text:
+        text = '@import url("wallpaper-content.css");\n' + (("\n" + text) if text.strip() else "")
+        write(user_content, text)
+
+    user_js = profile / "user.js"
+    prefs = "\n".join([
+        "// >>> wallpaper-theme >>>",
+        'user_pref("toolkit.legacyUserProfileCustomizations.stylesheets", true);',
+        'user_pref("browser.theme.toolbar-theme", 0);',
+        'user_pref("browser.theme.content-theme", 0);',
+        'user_pref("ui.systemUsesDarkTheme", 1);',
+        'user_pref("layout.css.prefers-color-scheme.content-override", 0);',
+        "// <<< wallpaper-theme <<<",
+    ])
+    old = read(user_js)
+    if "// >>> wallpaper-theme >>>" in old:
+        new = re.sub(
+            r"// >>> wallpaper-theme >>>.*?// <<< wallpaper-theme <<<\n?",
+            prefs + "\n",
+            old,
+            flags=re.DOTALL,
+        )
+    else:
+        new = (old.rstrip() + "\n\n" if old.strip() else "") + prefs + "\n"
+    write(user_js, new)
+
+
+# ---------------------------------------------------------------------------
+# terminals
+# ---------------------------------------------------------------------------
+
+def write_kitty(palette: dict) -> None:
+    t = palette["dark"]["terminal"]
+    lines = [
+        "# Generated by wallpaper-theme.",
+        f"background {t['background']}",
+        f"foreground {t['foreground']}",
+        f"cursor {t['cursor']}",
+        f"cursor_text_color {t['cursor_text']}",
+        f"selection_background {t['selection_bg']}",
+        f"selection_foreground {t['selection_fg']}",
+        f"url_color {t['cursor']}",
+        f"active_border_color {t['cursor']}",
+        f"inactive_border_color {palette['dark']['outline']}",
+        f"active_tab_foreground {t['cursor_text']}",
+        f"active_tab_background {t['cursor']}",
+        f"inactive_tab_foreground {palette['dark']['text_dim']}",
+        f"inactive_tab_background {palette['dark']['surface_container']}",
+        f"cursor_trail_color {palette['dark']['text_dim']}",
+    ]
+    for i, name in enumerate(["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"]):
+        lines.append(f"color{i} {t['normal'][name]}")
+    for i, name in enumerate(["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"], start=8):
+        lines.append(f"color{i} {t['bright'][name]}")
+
+    write(KITTY_DIR / "themes" / "wallpaper.conf", "\n".join(lines) + "\n")
+
+    conf_path = KITTY_DIR / "kitty.conf"
+    conf = read(conf_path)
+    if "include themes/wallpaper.conf" not in conf:
+        conf = conf.rstrip() + "\ninclude themes/wallpaper.conf\n"
+        write(conf_path, conf)
+
+
+def write_btop(palette: dict) -> None:
+    d = palette["dark"]
+    lines = [
+        "# btop theme generated by wallpaper-theme",
+        f'theme[main_bg]="{d["surface"]}"',
+        f'theme[main_fg]="{d["text"]}"',
+        f'theme[title]="{d["accent"]}"',
+        f'theme[hi_fg]="{d["accent_alt"]}"',
+        f'theme[selected_bg]="{d["accent_container"]}"',
+        f'theme[selected_fg]="{d["on_accent_container"]}"',
+        f'theme[inactive_fg]="{d["text_dim"]}"',
+        f'theme[proc_misc]="{d["accent_alt"]}"',
+        f'theme[cpu_box]="{d["text_dim"]}"',
+        f'theme[mem_box]="{d["text_dim"]}"',
+        f'theme[net_box]="{d["text_dim"]}"',
+        f'theme[proc_box]="{d["text_dim"]}"',
+        f'theme[div_line]="{d["outline"]}"',
+    ]
+    for name in ("temp", "cpu", "free", "cached", "available", "used", "download", "upload"):
+        lines += [
+            f'theme[{name}_start]="{d["accent"]}"',
+            f'theme[{name}_mid]="{d["accent_alt"]}"',
+            f'theme[{name}_end]="{d["accent_dim"]}"',
+        ]
+    write(BTOP_DIR / "themes" / "wallpaper.theme", "\n".join(lines) + "\n")
+
+    conf_path = BTOP_DIR / "btop.conf"
+    conf = read(conf_path)
+    if re.search(r'(?m)^color_theme\s*=\s*"(?:noctalia|wallpaper)"\s*$', conf):
+        conf = re.sub(
+            r'(?m)^color_theme\s*=\s*"(?:noctalia|wallpaper)"\s*$',
+            'color_theme = "wallpaper"',
+            conf,
+        )
+        write(conf_path, conf)
+
+
+# ---------------------------------------------------------------------------
+# Hyprland borders
+# ---------------------------------------------------------------------------
+
+def hypr_lua(d: dict) -> str:
+    return f"""-- Generated by wallpaper-theme from the current wallpaper. Do not edit.
+WALLPAPER_ACCENT = "{hypr(d['accent'])}"
+WALLPAPER_ACCENT_ALT = "{hypr(d['accent_alt'])}"
+WALLPAPER_BORDER_INACTIVE = "{hypr(d['outline'])}"
+"""
+
+
+def apply_hypr(palette: dict) -> None:
+    d = palette["dark"]
+    write(HYPR_COLORS, hypr_lua(d))
+
+    if not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return
+    if not any(Path(p).exists() for p in ("/usr/bin/hyprctl", "/bin/hyprctl")):
+        return
+
+    accent = hypr(d["accent"])
+    accent_alt = hypr(d["accent_alt"])
+    inactive = hypr(d["outline"])
+    # This build exposes the config as Lua, so keywords are not supported.
+    # hl.config() mutates the live config when evaluated.
+    code = f"""hl.config({{
+    general = {{ col = {{
+        active_border = {{ colors = {{ "{accent}", "{accent_alt}" }}, angle = 45 }},
+        inactive_border = "{inactive}",
+    }} }},
+    group = {{
+        col = {{
+            border_active = "{accent}",
+            border_inactive = "{inactive}",
+            border_locked_active = "{accent_alt}",
+            border_locked_inactive = "{inactive}",
+        }},
+        groupbar = {{ col = {{
+            active = "{accent}",
+            inactive = "{inactive}",
+            locked_active = "{accent_alt}",
+            locked_inactive = "{inactive}",
+        }} }},
+    }},
+    misc = {{ col = {{ splash = "{accent}" }} }},
+}})"""
+    run(["hyprctl", "eval", code], timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# driver
+# ---------------------------------------------------------------------------
+
+def apply(wallpaper: Path, quiet: bool = False) -> bool:
+    analysis = analyze_image(wallpaper)
+    palette = build_palette(wallpaper, analysis)
+    CACHE.mkdir(parents=True, exist_ok=True)
+    write(PALETTE_FILE, json.dumps(palette, indent=2) + "\n")
+
+    sync_noctalia(palette)
+
+    for directory in GTK_DIRS:
+        write(
+            directory / "wallpaper.css",
+            gtk_css(palette["dark"], extra_vars=directory.name == "gtk-4.0"),
+        )
+        ensure_gtk_imports(directory)
+
+    write_kde(palette)
+    write_qt(palette)
+    write_legacy_noctalia(palette)
+    write_rofi(palette)
+    write_vesktop(palette)
+    write_librewolf(palette)
+    write_kitty(palette)
+    write_btop(palette)
+    apply_hypr(palette)
+
+    if not quiet:
+        d = palette["dark"]
+        mode = "chromatic" if palette["chromatic"] else "monochrome"
+        log(f"{wallpaper.name}: {mode}, accent {d['accent']}, surface {d['surface']}")
+        log("updated GTK, KDE, Qt, rofi, Vesktop, LibreWolf, kitty, btop and Hyprland borders")
+        if noctalia_running():
+            log("Noctalia keeps its own wallpaper-derived palette")
+    return True
+
+
+def watch() -> int:
+    CACHE.mkdir(parents=True, exist_ok=True)
+    lock_file = (CACHE / "watch.lock").open("w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return 0
+
+    last: tuple | None = None
+    while True:
+        try:
+            wallpaper = get_wallpaper()
+            if wallpaper:
+                stat = wallpaper.stat()
+                signature = (str(wallpaper), stat.st_mtime_ns, stat.st_size)
+                if signature != last:
+                    try:
+                        apply(wallpaper, quiet=True)
+                    except Exception as exc:
+                        log(f"apply failed: {exc}")
+                    last = signature
+        except Exception as exc:
+            log(f"watch error: {exc}")
+        time.sleep(2)
+
+
+def main() -> int:
+    command = sys.argv[1] if len(sys.argv) > 1 else "apply"
+
+    if command in ("apply", "once"):
+        wallpaper = get_wallpaper(sys.argv[2] if len(sys.argv) > 2 else None)
+        if not wallpaper:
+            log("no wallpaper found")
+            return 1
+        apply(wallpaper)
+        return 0
+
+    if command == "watch":
+        return watch()
+
+    if command == "status":
+        text = read(PALETTE_FILE)
+        if text:
+            print(text, end="")
+            return 0
+        wallpaper = get_wallpaper()
+        if not wallpaper:
+            log("no wallpaper found")
+            return 1
+        palette = build_palette(wallpaper, analyze_image(wallpaper))
+        print(json.dumps(palette, indent=2))
+        return 0
+
+    print(__doc__.strip())
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

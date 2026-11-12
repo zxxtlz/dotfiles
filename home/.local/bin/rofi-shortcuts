@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+"""Show every Hyprland binding in rofi and run the selected one.
+
+Bindings are read from the live Lua config (via hypr-binds-json.lua), so loop
+generated workspace binds and anything added later appear automatically.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+HOME = Path.home()
+BIN = HOME / ".local" / "bin"
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
+
+
+def notify(message: str) -> None:
+    if shutil.which("notify-send"):
+        subprocess.run(
+            ["notify-send", "-a", "Rofi Shortcuts", "Shortcuts", message],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    else:
+        print(message, file=sys.stderr)
+
+
+def load_binds() -> list[dict]:
+    helper = BIN / "hypr-binds-json.lua"
+    try:
+        out = subprocess.check_output(
+            ["lua", str(helper)],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        return json.loads(out)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        notify(f"Could not read Hyprland binds: {exc}")
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Human-readable labels
+# ---------------------------------------------------------------------------
+
+CODE_KEYS = {f"code:{9 + d}": str(d) for d in range(1, 10)}
+CODE_KEYS.update(
+    {
+        "code:19": "0",
+        "code:82": "Numpad −",
+        "code:86": "Numpad +",
+        "mouse_up": "Scroll Up",
+        "mouse_down": "Scroll Down",
+        "mouse:272": "Left Mouse",
+        "mouse:273": "Right Mouse",
+    }
+)
+
+PRETTY_KEYS = {
+    "SUPER": "Super",
+    "CONTROL": "Ctrl",
+    "SHIFT": "Shift",
+    "ALT": "Alt",
+    "RETURN": "Return",
+    "ESCAPE": "Escape",
+    "SLASH": "/",
+    "SLASH_KEY": "/",
+    "PERIOD": ".",
+    "MINUS": "−",
+    "PLUS": "+",
+    "TAB": "Tab",
+    "SPACE": "Space",
+    "PRINT": "Print",
+    "LEFT": "←",
+    "RIGHT": "→",
+    "UP": "↑",
+    "DOWN": "↓",
+}
+
+
+def key_label(key: str) -> str:
+    parts = []
+    for part in key.split(" + "):
+        part = CODE_KEYS.get(part, part)
+        parts.append(PRETTY_KEYS.get(part.upper(), part))
+    return " + ".join(parts)
+
+
+def exec_label(command: str) -> str:
+    command = command.strip()
+    match = command.removeprefix("uwsm app -- ").strip()
+
+    known = [
+        ("rofi -show drun", "Rofi — application launcher"),
+        ("rofi -show window", "Rofi — window switcher"),
+        ("rofi -show run", "Rofi — run command"),
+        ("rofi -show shortcuts", "Rofi — all shortcuts"),
+        ("/home/zxx/.local/bin/rofi-shortcuts", "Rofi — all shortcuts"),
+        ("hyprctl kill", "Kill the active window"),
+        ("hyprpicker -a -n", "Colour picker — copy hex"),
+        ("/home/zxx/.local/bin/screenshot region", "Screenshot — select a region"),
+        ("/home/zxx/.local/bin/screenshot full", "Screenshot — whole screen"),
+        ("/home/zxx/.local/bin/shell-switch toggle", "Switch desktop shell (Noctalia ↔ Ukishima)"),
+        ("/home/zxx/.local/bin/ukishima-autohide", "Ukishima — toggle pill auto-hide"),
+        ("noctalia msg panel-toggle control-center notifications", "Noctalia — notifications"),
+        ("noctalia msg panel-toggle control-center", "Noctalia — control centre"),
+        ("noctalia msg panel-toggle launcher /emo", "Noctalia — emoji picker"),
+        ("noctalia msg panel-toggle launcher", "Noctalia — app launcher"),
+        ("noctalia msg panel-toggle wallpaper", "Noctalia — wallpaper picker"),
+        ("noctalia msg panel-toggle clipboard", "Noctalia — clipboard history"),
+        ("noctalia msg panel-toggle session", "Noctalia — session menu"),
+        ("noctalia msg settings-toggle", "Noctalia — settings"),
+        ("noctalia msg window-switcher", "Noctalia — window switcher"),
+        ("noctalia msg session lock", "Noctalia — lock screen"),
+        ("noctalia msg volume-up", "Volume up"),
+        ("noctalia msg volume-down", "Volume down"),
+        ("noctalia msg volume-mute", "Mute output"),
+        ("noctalia msg mic-mute", "Mute microphone"),
+        ("noctalia msg media toggle", "Media — play/pause"),
+        ("noctalia msg media next", "Media — next track"),
+        ("noctalia msg media previous", "Media — previous track"),
+        ("noctalia msg brightness-up", "Brightness up"),
+        ("noctalia msg brightness-down", "Brightness down"),
+        ("kitty -e btop", "Open btop (system monitor)"),
+        ("kitty", "Open terminal (kitty)"),
+        ("dolphin", "Open file manager (Dolphin)"),
+        ("librewolf", "Open browser (LibreWolf)"),
+        ("gnome-text-editor --new-window", "Open text editor"),
+        ("gnome-calculator", "Open calculator"),
+    ]
+    for prefix, label in known:
+        if match == prefix or match.startswith(prefix + " "):
+            return label
+
+    if "ipc call ukishima wallpaper" in match:
+        return "Ukishima — wallpaper picker"
+    if "ipc call ukishima " in match:
+        surface = match.split("ipc call ukishima ", 1)[1].split()[0]
+        return f"Ukishima — open {surface}"
+
+    return "Run: " + (match if len(match) <= 70 else match[:67] + "…")
+
+
+DIRECTIONS = {
+    "left": "left",
+    "right": "right",
+    "up": "up",
+    "down": "down",
+    "l": "left",
+    "r": "right",
+    "u": "up",
+    "d": "down",
+}
+
+
+def first_arg(entry: dict):
+    args = entry.get("args") or []
+    return args[0] if args else None
+
+
+def dsp_label(path: str, entry: dict) -> str:
+    arg = first_arg(entry)
+    value = arg if not isinstance(arg, dict) else None
+
+    if path == "window.close":
+        return "Close the active window"
+    if path == "window.float":
+        return "Toggle floating"
+    if path == "window.fullscreen":
+        return "Toggle fullscreen"
+    if path == "layout" and value == "togglesplit":
+        return "Toggle split direction"
+    if path == "window.cycle_next":
+        return "Cycle through windows"
+    if path == "window.drag":
+        return "Drag window (hold left mouse)"
+    if path == "window.resize":
+        return "Resize window (hold right mouse)"
+    if path == "workspace.toggle_special":
+        return "Toggle scratchpad (special workspace)"
+
+    if path == "focus" and isinstance(arg, dict):
+        if "direction" in arg:
+            return f"Focus {DIRECTIONS.get(str(arg['direction']), arg['direction'])}"
+        workspace = str(arg.get("workspace", ""))
+        if workspace == "m+1":
+            return "Switch to the next workspace"
+        if workspace == "m-1":
+            return "Switch to the previous workspace"
+        if workspace == "emptym":
+            return "Switch to the next empty workspace"
+        if workspace.startswith("m~"):
+            return f"Switch to workspace {workspace[2:]} on the other monitor"
+        return f"Switch to workspace {workspace}"
+
+    if path == "window.move" and isinstance(arg, dict):
+        if "direction" in arg:
+            return f"Move window {DIRECTIONS.get(str(arg['direction']), arg['direction'])}"
+        if "monitor" in arg:
+            return (
+                "Move window to the next monitor"
+                if str(arg["monitor"]) == "+1"
+                else "Move window to the previous monitor"
+            )
+        workspace = str(arg.get("workspace", ""))
+        silent = " (without following)" if arg.get("follow") is False else ""
+        if workspace == "special":
+            return "Move window to the scratchpad" + silent
+        if workspace == "m+1":
+            return "Move window to the next workspace" + silent
+        if workspace == "m-1":
+            return "Move window to the previous workspace" + silent
+        if workspace.startswith("m~"):
+            return f"Move window to workspace {workspace[2:]} on the other monitor" + silent
+        return f"Move window to workspace {workspace}" + silent
+
+    pretty = path.replace(".", " → ")
+    if isinstance(arg, dict):
+        pretty += " " + json.dumps(arg, ensure_ascii=False)
+    elif arg is not None:
+        pretty += f" {arg}"
+    return pretty
+
+
+def describe(entry: dict) -> str:
+    kind = entry.get("kind")
+    if kind == "function":
+        key = entry.get("key", "").lower()
+        if "minus" in key or "code:82" in key:
+            return "Zoom desktop out"
+        if "plus" in key or "code:86" in key:
+            return "Zoom desktop in"
+        return "Custom Lua action"
+    if kind == "exec":
+        return exec_label(str(first_arg(entry) or ""))
+    path = str(entry.get("path", ""))
+    if path == "exec_cmd":
+        return exec_label(str(first_arg(entry) or ""))
+    if path:
+        return dsp_label(path, entry)
+    return "Custom action"
+
+
+# ---------------------------------------------------------------------------
+# Executing the selection
+# ---------------------------------------------------------------------------
+
+
+def lua_string(value: str) -> str:
+    value = value.replace("\\", "\\\\").replace('"', '\\"')
+    value = value.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+    return f'"{value}"'
+
+
+def lua_literal(value) -> str:
+    if value is None:
+        return "nil"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, str):
+        return lua_string(value)
+    if isinstance(value, list):
+        return "{ " + ", ".join(lua_literal(v) for v in value) + " }"
+    if isinstance(value, dict):
+        return (
+            "{ "
+            + ", ".join(f"{k} = {lua_literal(v)}" for k, v in sorted(value.items()))
+            + " }"
+        )
+    return lua_string(str(value))
+
+
+def zoom_expression(delta: float) -> str:
+    operator = "+" if delta > 0 else "-"
+    return (
+        'local z = hl.get_config("cursor:zoom_factor"); '
+        f"if z {operator} {abs(delta)} > 3.0 then z = 3.0 "
+        f"elseif z {operator} {abs(delta)} < 1.0 then z = 1.0 "
+        f"else z = z {operator} {abs(delta)} end; "
+        'hl.config({ cursor = { zoom_factor = z } })'
+    )
+
+
+def dispatch_lua(entry: dict) -> int:
+    path = str(entry.get("path", ""))
+    args = entry.get("args") or []
+    call = f"hl.dsp.{path}(" + ", ".join(lua_literal(a) for a in args) + ")"
+    result = subprocess.run(
+        ["hyprctl", "dispatch", call],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        notify((result.stderr or result.stdout or "Hyprland rejected the action").strip())
+        return result.returncode
+    return 0
+
+
+def run_entry(entry: dict) -> int:
+    kind = entry.get("kind")
+    if kind == "function":
+        key = entry.get("key", "").lower()
+        delta = 0.3 if ("plus" in key or "code:86" in key) else -0.3
+        result = subprocess.run(
+            ["hyprctl", "eval", zoom_expression(delta)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            notify((result.stderr or result.stdout or "Hyprland rejected the action").strip())
+            return result.returncode
+        return 0
+
+    path = str(entry.get("path", ""))
+    if kind == "exec" or path == "exec_cmd":
+        command = str(first_arg(entry) or "")
+        if not command:
+            return 0
+        subprocess.Popen(
+            ["sh", "-c", command],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return 0
+
+    return dispatch_lua(entry)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main() -> int:
+    if not shutil.which("rofi"):
+        notify("rofi is not installed.")
+        return 1
+
+    binds = load_binds()
+    if not binds:
+        notify("No Hyprland bindings found.")
+        return 1
+
+    rows: list[str] = []
+    by_row: dict[str, dict] = {}
+    for entry in binds:
+        key = key_label(str(entry.get("key", "")))
+        label = describe(entry)
+        row = f"{key:<29}  {label}"
+        # A key combo is unique in a normal binds file, but keep every entry
+        # reachable even if two rows would otherwise be identical.
+        while row in by_row:
+            row += " "
+        rows.append(row)
+        by_row[row] = entry
+
+    if "--print" in sys.argv:
+        print("\n".join(rows))
+        return 0
+
+    result = subprocess.run(
+        [
+            "rofi",
+            "-dmenu",
+            "-i",
+            "-p",
+            "Shortcuts",
+            "-mesg",
+            "Select a shortcut to run it",
+            "-format",
+            "s",
+            "-no-custom",
+        ],
+        input="\n".join(rows),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if result.returncode != 0:
+        return 0
+
+    selected = result.stdout.rstrip("\n")
+    entry = by_row.get(selected)
+    if entry is None:
+        return 0
+    return run_entry(entry)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

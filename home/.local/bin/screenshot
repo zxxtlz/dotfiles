@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Screenshot helper that works in both Noctalia and Ukishima.
+#
+#   screenshot region   select an area with slurp
+#   screenshot full     capture the focused monitor
+#
+# Saves a PNG under ~/Pictures/Screenshots, copies it to the clipboard and
+# sends a notification.
+set -u
+
+mode="${1:-region}"
+case "$mode" in
+  region | full) ;;
+  *)
+    printf 'usage: screenshot [region|full]\n' >&2
+    exit 2
+    ;;
+esac
+
+pictures=$(xdg-user-dir PICTURES 2>/dev/null || true)
+[ -n "$pictures" ] || pictures="$HOME/Pictures"
+dir="$pictures/Screenshots"
+mkdir -p -- "$dir" || exit 1
+
+file="$dir/$(date +%Y-%m-%d_%H-%M-%S).png"
+
+if [ "$mode" = region ]; then
+  geometry=$(slurp 2>/dev/null) || exit 0
+  [ -n "$geometry" ] || exit 0
+  grim -g "$geometry" "$file" || {
+    notify-send -a "Screenshot" -i dialog-error "Screenshot failed" \
+      "grim could not capture the selected area." >/dev/null 2>&1 || true
+    exit 1
+  }
+else
+  grim "$file" || {
+    notify-send -a "Screenshot" -i dialog-error "Screenshot failed" \
+      "grim could not capture the screen." >/dev/null 2>&1 || true
+    exit 1
+  }
+fi
+
+wl-copy <"$file" >/dev/null 2>&1 || true
+notify-send -a "Screenshot" -i "$file" "Screenshot saved" "$file" \
+  >/dev/null 2>&1 || true
+printf '%s\n' "$file"

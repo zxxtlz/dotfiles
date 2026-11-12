@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Viber
+Exec=/opt/viber/Viber AutoStart
+TryExec=/opt/viber/Viber
+Icon=viber

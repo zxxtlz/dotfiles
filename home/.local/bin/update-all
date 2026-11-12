@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# update-all — one-shot updater for every package manager on this machine.
+#
+# Launched from the Noctalia bar button (the cloud glyph next to the volume
+# widget), or run manually in any terminal. Covers, in order:
+#   1. pacman repos + AUR        (yay -Syu — one transaction for both)
+#   2. Flatpak apps              (update + prune unused runtimes)
+#   3. Noctalia shell plugins    (noctalia msg plugins update)
+#   4. pacman cache housekeeping (paccache: keep 2 old versions, drop
+#      caches of uninstalled packages)
+#
+# Each step reports its own failure and the script keeps going, so one
+# manager being broken never hides the others. The window stays open at
+# the end ("press Enter") so the log can be read before it disappears.
+
+set -uo pipefail
+
+bold=$'\e[1m'; dim=$'\e[2m'; blue=$'\e[34m'; green=$'\e[32m'
+yellow=$'\e[33m'; red=$'\e[31m'; reset=$'\e[0m'
+hr="────────────────────────────────────────────────────────────────────────"
+
+step() { printf '\n%s\n%s%s%s\n%s\n' "$hr" "${blue}${bold}" "$*" "$reset" "$hr"; }
+warn() { printf '%s\n' "${yellow}warning:${reset} $*"; }
+
+notify() {
+    command -v notify-send >/dev/null 2>&1 &&
+        notify-send -a "update-all" -i software-update-available "$@" 2>/dev/null || true
+}
+
+failures=0
+track() { # track <exit-code> <step-name>
+    if [ "$1" -ne 0 ]; then
+        failures=$((failures + 1))
+        warn "$2 failed (exit $1) — continuing with the rest."
+    fi
+}
+
+printf '%supdate-all%s — %s\n' "${bold}" "$reset" "$(date '+%A, %d %B %Y %H:%M')"
+printf '%spacman+AUR · Flatpak · Noctalia plugins · cache cleanup%s\n\n' "$dim" "$reset"
+notify "System update started" "pacman + AUR · Flatpak · plugins · cache"
+
+# ------------------------------------------------------------------ 1/4 ---
+step "1/4 · pacman repositories + AUR"
+if command -v yay >/dev/null 2>&1; then
+    yay -Syu
+    track $? "yay -Syu (pacman + AUR)"
+else
+    echo "yay not found — falling back to plain pacman (no AUR)."
+    sudo pacman -Syu
+    track $? "pacman -Syu"
+fi
+
+# ------------------------------------------------------------------ 2/4 ---
+step "2/4 · Flatpak"
+if command -v flatpak >/dev/null 2>&1; then
+    flatpak update --assumeyes
+    track $? "flatpak update"
+    flatpak uninstall --unused --assumeyes
+    track $? "flatpak uninstall --unused"
+else
+    warn "flatpak is not installed — skipping."
+fi
+
+# ------------------------------------------------------------------ 3/4 ---
+step "3/4 · Noctalia shell plugins"
+if command -v noctalia >/dev/null 2>&1 && pgrep -x noctalia >/dev/null 2>&1; then
+    noctalia msg plugins update
+    track $? "noctalia plugin update"
+else
+    echo "Noctalia is not running — nothing to update."
+fi
+
+# ------------------------------------------------------------------ 4/4 ---
+step "4/4 · package cache housekeeping"
+if command -v paccache >/dev/null 2>&1; then
+    paccache -rk2   # keep at most 2 old versions of installed packages
+    track $? "paccache -rk2"
+    paccache -ruk0  # drop cached versions of uninstalled packages entirely
+    track $? "paccache -ruk0"
+else
+    warn "paccache not found (install pacman-contrib) — skipping."
+fi
+
+# ------------------------------------------------------------------ done ---
+printf '\n%s\n' "$hr"
+if [ "$failures" -eq 0 ]; then
+    printf '%sAll done — every package manager is up to date.%s\n' "${green}${bold}" "$reset"
+    notify "System update finished" "All package managers are up to date."
+else
+    printf '%sFinished with %d warning(s) — scroll up to review.%s\n' "${red}${bold}" "$failures" "$reset"
+    notify "System update finished" "$failures step(s) reported warnings — check the log."
+fi
+
+printf '\nPress %sEnter%s to close this window… ' "${bold}" "$reset"
+read -r _
+exit "$failures"
