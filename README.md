@@ -3,9 +3,9 @@
 My personal Linux desktop setup — **CachyOS + Hyprland (Wayland)**.
 
 > **Read this first:** these are my real configs, not a portable distro.
-> `install.sh` only symlinks files — it does **not** install packages.
-> Get the prerequisites below in place, or the setup will look/behave
-> differently (or not start at all).
+> On CachyOS/Arch, `install.sh` installs the required packages and then
+> symlinks the configs. On other distros it can only link files
+> (`--no-packages`), so install the equivalents yourself first.
 
 The repo mirrors my home directory under [`home/`](home/), and `install.sh`
 symlinks everything into place. Existing files are backed up, never deleted.
@@ -29,20 +29,26 @@ symlinks everything into place. Existing files are backed up, never deleted.
   btop, rofi and Neovim icons. Without it, everything falls back to a plain
   monospace font.
 - **Bibata-Modern-Ice** cursor theme — referenced by `uwsm/env`, GTK and
-  xsettingsd. Not bundled here (the files are ~28 MB); install it separately.
+  xsettingsd. Not bundled here (the files are ~28 MB); `install.sh` installs
+  it from the AUR.
 
 ### Packages
 
-Core packages on CachyOS/Arch:
+The installer can install everything below automatically on Arch-based
+distros — `pacman` for repo packages and `paru`/`yay` for the two AUR
+packages. To install the core set manually instead:
 
 ```bash
 sudo pacman -S --needed \
   hyprland uwsm xdg-desktop-portal-hyprland xdg-desktop-portal-gtk \
-  kitty alacritty fish zsh bash neovim vim micro \
-  btop cava rofi wl-clipboard cliphist slurp grim jq python python-pillow \
-  gtk3 gtk4 adw-gtk-theme qt5ct qt6ct wireplumber \
-  dolphin librewolf noctalia swash hyprmon-bin awww \
+  kitty alacritty fish zsh neovim vim micro \
+  noctalia swash awww rofi btop cava \
+  wl-clipboard cliphist slurp grim jq python python-pillow \
+  gtk3 gtk4 adw-gtk-theme qt5ct qt6ct wireplumber dolphin \
   ttf-meslo-nerd ttf-fantasque-nerd
+
+# AUR (or let install.sh do it through paru/yay)
+paru -S --needed hyprmon-bin bibata-cursor-theme
 ```
 
 CachyOS also ships defaults that my configs source/assume:
@@ -52,19 +58,20 @@ sudo pacman -S --needed cachyos-fish-config cachyos-zsh-config \
   cachyos-alacritty-config cachyos-micro-settings cachyos-hypr-noctalia
 ```
 
-Some packages (`noctalia`, `swash`, `hyprmon-bin`, `awww`) may come from the
-CachyOS repos or the AUR — use `paru -S …` / `yay -S …` if `pacman` can't
-find them. On non-Arch distros, install the equivalents and adjust the
-`source /usr/share/cachyos-*` lines in the shell configs.
+The installer adds those only when they exist in your configured repos, so
+plain Arch simply skips them. On non-Arch distros, install equivalents and
+adjust the `source /usr/share/cachyos-*` lines in the shell configs.
 
-Optional but assumed by parts of the setup:
+Optional extras (installed with `./install.sh --optional`):
 
 - `fish-pure-prompt`, `fish-autopair`, `fisher` — fish prompt and UX
 - `zsh-autosuggestions`, `zsh-syntax-highlighting`, `zsh-completions`,
   `zsh-history-substring-search`, `zsh-theme-powerlevel10k` — zsh setup
-- Swift toolchain + `sourcekit-lsp` — Neovim Swift support
-- `syncthing`, `localsend`, `viber`, `librepods`, Lunar Client — autostart
-  entries in `~/.config/hypr/config/autostart.lua`; delete them if unused
+- `librewolf` — my default browser
+- `syncthing` — started from Hyprland autostart
+- Swift toolchain + `sourcekit-lsp` — Neovim Swift support (not packaged here)
+- `localsend`, `viber`, `librepods`, Lunar Client — autostart entries in
+  `~/.config/hypr/config/autostart.lua`; delete them if unused
 
 `install.sh` will link configs even for apps you don't have — those configs
 simply do nothing until the app is installed.
@@ -76,7 +83,8 @@ simply do nothing until the app is installed.
   `hypr/config/wallpaper-colors.lua`), so colors match out of the box — but
   the wallpaper image itself is not here, and `wallpaper-theme watch` will
   re-derive colors from whatever wallpaper you use.
-- **Cursor theme files** (Bibata) — install the theme package yourself.
+- **Cursor theme files** (Bibata) — installed from the AUR by `install.sh`;
+  with `--no-packages`, install `bibata-cursor-theme` yourself.
 - **Ukishima** shell — the alternative shell that `shell-switch` can toggle
   to. Noctalia is the default.
 - **Secrets and app state** — SSH/GPG keys, credentials, browser profiles,
@@ -88,9 +96,17 @@ simply do nothing until the app is installed.
 git clone https://github.com/zxxtlz/dotfiles.git ~/dotfiles
 cd ~/dotfiles
 
-./install.sh --dry-run   # preview what will happen
-./install.sh             # symlink everything into $HOME
+./install.sh --dry-run   # show packages + link changes
+./install.sh             # install packages, then symlink
 ```
+
+`install.sh` will:
+
+1. detect your distro and split packages into repo vs. AUR,
+2. show the list and ask for confirmation,
+3. install with `pacman` (and `paru`/`yay` for AUR packages),
+4. back up existing dotfiles and symlink mine into `$HOME`,
+5. enable `cliphist-store.service` when a systemd user session is available.
 
 Then log out and back in (or restart Hyprland) so the session picks up the
 new config.
@@ -99,14 +115,25 @@ new config.
 
 | Command | Effect |
 | --- | --- |
-| `./install.sh` | Symlink dotfiles into `$HOME` (default) |
+| `./install.sh` | Install required packages, then symlink dotfiles |
+| `./install.sh --no-packages` | Skip packages; only symlink (use on non-Arch) |
+| `./install.sh --packages-only` | Install packages, skip linking |
+| `./install.sh --optional` | Also install optional extras (plugins, browser, …) |
+| `./install.sh --no-aur` | Never use paru/yay for AUR packages |
+| `./install.sh --yes`, `-y` | Assume yes for prompts (non-interactive) |
 | `./install.sh --copy` | Copy files instead of symlinking |
 | `./install.sh --dry-run` | Print actions, change nothing |
 | `./install.sh --backup-dir DIR` | Put replaced files in `DIR` |
 | `./install.sh --help` | Show usage |
 
+If `paru`/`yay` is not installed, the two AUR packages (`hyprmon-bin`,
+`bibata-cursor-theme`) are listed with a manual install command instead of
+being installed automatically.
+
 ### How it works
 
+- Required packages are installed from your configured repos with `pacman`;
+  AUR-only packages go through `paru`/`yay` when available.
 - Files in `home/` are linked to the same path in your home directory.
 - Directories that must be shared with other apps (`~/.config`, `~/.local/bin`)
   are **merged**: each child is linked individually, so your existing
