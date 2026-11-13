@@ -160,7 +160,7 @@ installer (`~/.local/state/dotfiles-backups/`).
 | **Window manager** | `~/.config/hypr/` — Lua-based Hyprland config: binds, animations, monitors, window rules, workspaces, autostart |
 | **Terminals** | `~/.config/kitty/`, `~/.config/alacritty/` (incl. Noctalia/wallpaper themes) |
 | **Editor** | `~/.vimrc`, `~/.config/nvim/` (LazyVim), `~/.config/micro/` |
-| **Desktop theme** | `~/.config/gtk-3.0/`, `~/.config/gtk-4.0/`, `~/.config/qt5ct/`, `~/.config/qt6ct/`, `kdeglobals`, `xsettingsd`, `mimeapps.list` |
+| **Desktop theme** | `~/.config/gtk-3.0/`, `~/.config/gtk-4.0/`, `~/.config/qt5ct/`, `~/.config/qt6ct/`, `~/.config/nwg-look/`, `kdeglobals`, `xsettingsd`, `mimeapps.list` |
 | **Bars & widgets** | `~/.config/noctalia/`, `~/.config/rofi/`, `~/.config/btop/`, `~/.config/cava/` |
 | **Session / audio** | `~/.config/uwsm/`, `~/.config/wireplumber/`, `~/.config/systemd/user/cliphist-store.service` |
 | **Scripts** | `~/.local/bin/` — screenshot, shell-switch, wallpaper-theme, update-all, rofi-shortcuts, … |
