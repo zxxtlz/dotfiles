@@ -4,7 +4,7 @@ ui_scale = 1.20
 [bar.default]
 center = [ "workspaces", "spacer_1", "active_window" ]
 concave_edge_corners = true
-end = [ "media", "spacer_1", "tray", "notifications", "network", "volume", "update_all", "session" ]
+end = [ "media", "spacer_1", "tray", "notifications", "network", "volume", "compress10mb", "update_all", "session" ]
 margin_edge = 0
 margin_ends = 0
 radius_bottom_left = 12
@@ -148,6 +148,14 @@ right = "exec pavucontrol"
 
 # Update-everything button: opens a new kitty that runs update-all
 # (pacman + AUR via yay, Flatpak, Noctalia plugins, cache cleanup).
+[widget.compress10mb]
+type = "custom_button"
+glyph = "file-zip"
+tooltip = "Compress images/videos to under 10 MB"
+
+    [widget.compress10mb.actions]
+    left = "exec /home/zxx/.local/bin/compress10mb --pick"
+
 [widget.update_all]
 type = "custom_button"
 glyph = "cloud-download"

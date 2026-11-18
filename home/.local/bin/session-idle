@@ -1,0 +1,120 @@
+#!/bin/sh
+# session-idle - the idle ladder behind hypridle's 10-minute listener.
+#
+#   session-idle guard    wait out media, lock, then suspend 5 minutes later
+#   session-idle cancel   stop a pending guard (any input resumes the session)
+#   session-idle status   print "playing" or "idle" and exit 0/1
+#
+# hypridle already honours Wayland idle inhibitors, so a fullscreen video or a
+# game never starts its timer. This guard covers players that keep playing
+# without inhibiting idle (a windowed browser video, a music player): it waits
+# for MPRIS to leave Playing, gives a two-minute grace in case playback is only
+# paused, locks, and suspends five minutes after that. Activity kills the guard
+# through hypridle's on-resume, so a returning user is never locked out of a
+# machine that was seconds from sleeping.
+
+set -u
+PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+run="${XDG_RUNTIME_DIR:-/tmp}/session-idle"
+pidfile="$run/guard.pid"
+
+# Timings and actions are overridable so the ladder can be exercised without
+# actually locking and suspending the session (see the comments at the calls).
+grace="${SESSION_IDLE_GRACE:-120}"
+after_lock="${SESSION_IDLE_SUSPEND_DELAY:-300}"
+lock_cmd="${SESSION_IDLE_LOCK:-$HOME/.local/bin/session-lock}"
+suspend_cmd="${SESSION_IDLE_SUSPEND:-systemctl suspend}"
+
+playing() {
+    # Test seams: force the media state for the whole guard.
+    [ -n "${SESSION_IDLE_ASSUME_PLAYING:-}" ] && return 0
+    [ -n "${SESSION_IDLE_ASSUME_IDLE:-}" ] && return 1
+    for name in $(gdbus call --session \
+        --dest org.freedesktop.DBus \
+        --object-path /org/freedesktop/DBus \
+        --method org.freedesktop.DBus.ListNames 2>/dev/null |
+        grep -o 'org\.mpris\.MediaPlayer2\.[A-Za-z0-9_.-]*' | sort -u); do
+        status=$(gdbus call --session --dest "$name" \
+            --object-path /org/mpris/MediaPlayer2 \
+            --method org.freedesktop.DBus.Properties.Get \
+            org.mpris.MediaPlayer2.Player PlaybackStatus 2>/dev/null)
+        case "$status" in
+            *Playing*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Sleep in one-second slices: a trapped signal is only delivered between
+# foreground commands, and cancel must take effect while the guard is in its
+# two-minute grace or its five-minute post-lock wait. A single long sleep would
+# defer the cancel until after the lock or the suspend it was meant to stop.
+wait_for() {
+    n="$1"
+    while [ "$n" -gt 0 ]; do
+        sleep 1
+        n=$((n - 1))
+    done
+}
+
+case "${1:-guard}" in
+    guard)
+        mkdir -p "$run" 2>/dev/null
+        # A config reload can leave an older guard behind; it would race this
+        # one to the same lock and suspend.
+        if [ -f "$pidfile" ]; then
+            old=$(cat "$pidfile" 2>/dev/null)
+            case "$old" in
+                '' | *[!0-9]*) ;;
+                *)
+                    kill "$old" 2>/dev/null
+                    # Let the old guard's EXIT trap remove the pidfile before
+                    # this one claims it, so a late trap cannot erase the new.
+                    i=0
+                    while kill -0 "$old" 2>/dev/null && [ "$i" -lt 20 ]; do
+                        sleep 0.1
+                        i=$((i + 1))
+                    done
+                    ;;
+            esac
+        fi
+        echo $$ >"$pidfile"
+        trap '[ "$(cat "$pidfile" 2>/dev/null)" = "$$" ] && rm -f "$pidfile"' EXIT
+        trap 'exit 0' INT TERM
+
+        # If media is playing when the 10-minute timer fires, do not lock: wait
+        # for it to stop, then give a short grace (a pause is not "the user
+        # left", and the credits of a film are not either). If nothing is
+        # playing, the ten minutes are already up, so lock immediately.
+        if playing; then
+            while :; do
+                while playing; do sleep 1; done
+                wait_for "$grace"
+                playing || break
+            done
+        fi
+
+        sh -c "$lock_cmd"
+        wait_for "$after_lock"
+        playing && exit 0
+        sh -c "$suspend_cmd"
+        ;;
+    cancel)
+        if [ -f "$pidfile" ]; then
+            pid=$(cat "$pidfile" 2>/dev/null)
+            case "$pid" in
+                '' | *[!0-9]*) ;;
+                *) kill "$pid" 2>/dev/null ;;
+            esac
+            rm -f "$pidfile"
+        fi
+        ;;
+    status)
+        if playing; then
+            echo playing
+            exit 0
+        fi
+        echo idle
+        exit 1
+        ;;
+esac

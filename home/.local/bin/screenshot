@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
 # Screenshot helper that works in both Noctalia and Ukishima.
 #
-#   screenshot region   select an area with slurp
-#   screenshot full     capture the focused monitor
+#   screenshot freeze   freeze the frame, select a region, then edit in swappy
+#   screenshot region   select an area with slurp (legacy: saved + copied)
+#   screenshot full     capture the focused monitor (legacy: saved + copied)
 #
-# Saves a PNG under ~/Pictures/Screenshots, copies it to the clipboard and
-# sends a notification.
+# The default keybind (Super+P) uses "freeze": the current frame is captured
+# and shown fullscreen while you select a region, so nothing moves underneath
+# your selection.  swappy then opens as a GUI editor where you can annotate,
+# Save (to ~/Pictures/Screenshots) and/or Copy to the clipboard.
 set -u
 
 mode="${1:-region}"
 case "$mode" in
-  region | full) ;;
+  region | full | freeze) ;;
   *)
-    printf 'usage: screenshot [region|full]\n' >&2
+    printf 'usage: screenshot [freeze|region|full]\n' >&2
     exit 2
     ;;
 esac
@@ -22,25 +25,78 @@ pictures=$(xdg-user-dir PICTURES 2>/dev/null || true)
 dir="$pictures/Screenshots"
 mkdir -p -- "$dir" || exit 1
 
+notify() { notify-send -a "Screenshot" "$@" >/dev/null 2>&1 || true; }
+
+if [ "$mode" = freeze ]; then
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/shot-freeze.XXXXXX") || exit 1
+  frozen="$tmpdir/frozen.png"
+  crop="$tmpdir/crop.png"
+  freeze_pid=""
+
+  cleanup() {
+    [ -n "$freeze_pid" ] && kill "$freeze_pid" 2>/dev/null || true
+    rm -rf -- "$tmpdir"
+  }
+  trap cleanup EXIT INT TERM
+
+  # 1. Capture the live frame first so the overlay shows an exact still image.
+  if ! grim "$frozen"; then
+    notify -i dialog-error "Screenshot failed" "Could not capture the screen."
+    exit 1
+  fi
+
+  # 2. Show the still image fullscreen on top of everything: the screen is
+  #    effectively frozen while the region is chosen.
+  mpv --no-config --really-quiet --no-audio \
+      --input-terminal=no --no-input-default-bindings \
+      --image-display-duration=inf --loop-file=inf --keep-open=always \
+      --no-border --ontop --fullscreen --osc=no --osd-level=0 \
+      --no-cursor-autohide \
+      "$frozen" >/dev/null 2>&1 &
+  freeze_pid=$!
+  sleep 0.3
+
+  # 3. Select a region on the frozen frame.  Esc cancels.  Ask slurp for
+  #    ImageMagick's WxH+X+Y geometry (its default x,y WxH makes magick
+  #    -crop silently fall back to the whole image).
+  geometry=$(slurp -d -f '%wx%h+%x+%y' 2>/dev/null) || exit 0
+  [ -n "$geometry" ] || exit 0
+
+  # 4. Dismiss the freeze overlay before opening the editor.
+  kill "$freeze_pid" 2>/dev/null || true
+  wait "$freeze_pid" 2>/dev/null || true
+  freeze_pid=""
+  sleep 0.1
+
+  # 5. Crop the frozen capture to the chosen region.
+  if ! magick "$frozen" -crop "$geometry" +repage "$crop"; then
+    notify -i dialog-error "Screenshot failed" "Could not crop the selection."
+    exit 1
+  fi
+
+  # 6. Open the GUI editor.  swappy's Save/Copy buttons (Ctrl+s / Ctrl+c)
+  #    handle saving and clipboard; nothing is copied implicitly.
+  swappy -f "$crop" || exit $?
+  exit 0
+fi
+
+# Legacy modes: save, copy, notify.
 file="$dir/$(date +%Y-%m-%d_%H-%M-%S).png"
 
 if [ "$mode" = region ]; then
   geometry=$(slurp 2>/dev/null) || exit 0
   [ -n "$geometry" ] || exit 0
   grim -g "$geometry" "$file" || {
-    notify-send -a "Screenshot" -i dialog-error "Screenshot failed" \
-      "grim could not capture the selected area." >/dev/null 2>&1 || true
+    notify -i dialog-error "Screenshot failed" "grim could not capture the selected area."
     exit 1
   }
 else
   grim "$file" || {
-    notify-send -a "Screenshot" -i dialog-error "Screenshot failed" \
-      "grim could not capture the screen." >/dev/null 2>&1 || true
+    notify -i dialog-error "Screenshot failed" "grim could not capture the screen."
     exit 1
   }
 fi
 
 wl-copy <"$file" >/dev/null 2>&1 || true
-notify-send -a "Screenshot" -i "$file" "Screenshot saved" "$file" \
-  >/dev/null 2>&1 || true
+notify -i "$file" "Screenshot saved" "$file" || true
 printf '%s\n' "$file"

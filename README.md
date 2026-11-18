@@ -43,7 +43,8 @@ sudo pacman -S --needed \
   hyprland uwsm xdg-desktop-portal-hyprland xdg-desktop-portal-gtk \
   kitty alacritty fish zsh neovim vim micro \
   noctalia swash awww rofi btop cava \
-  wl-clipboard cliphist slurp grim jq python python-pillow \
+  wl-clipboard cliphist slurp grim swappy wtype hypridle \
+  jq python python-pillow \
   gtk3 gtk4 adw-gtk-theme qt5ct qt6ct wireplumber dolphin \
   ttf-meslo-nerd ttf-fantasque-nerd
 
@@ -135,9 +136,12 @@ being installed automatically.
 - Required packages are installed from your configured repos with `pacman`;
   AUR-only packages go through `paru`/`yay` when available.
 - Files in `home/` are linked to the same path in your home directory.
-- Directories that must be shared with other apps (`~/.config`, `~/.local/bin`)
-  are **merged**: each child is linked individually, so your existing
-  `~/.config` is not replaced by a single symlink.
+- Directories that must be shared with other apps (`~/.config`, `~/.local/bin`,
+  `~/.local/lib`) are **merged**: each child is linked individually, so your
+  existing `~/.config` is not replaced by a single symlink.
+- `hypridle`, `swappy` and `wtype` are installed as packages; if a config
+  calls them at `~/.local/bin/<tool>`, the installer adds a link to the
+  system binary when that path doesn't already exist.
 - Anything already at a destination is moved to
   `~/.local/state/dotfiles-backups/<timestamp>/` first.
 - Re-running the script is safe; links that are already correct are skipped.
@@ -157,13 +161,14 @@ installer (`~/.local/state/dotfiles-backups/`).
 | Area | Files |
 | --- | --- |
 | **Shell** | `~/.bashrc`, `~/.bash_profile`, `~/.bash_logout`, `~/.zshrc`, `~/.config/fish/config.fish` |
-| **Window manager** | `~/.config/hypr/` — Lua-based Hyprland config: binds, animations, monitors, window rules, workspaces, autostart |
+| **Window manager** | `~/.config/hypr/` — Lua-based Hyprland config: binds, animations, monitors, window rules, workspaces, autostart, idle daemon (`hypridle.conf`), and a locally built plugin (`~/.local/lib/hyprland/`) |
 | **Terminals** | `~/.config/kitty/`, `~/.config/alacritty/` (incl. Noctalia/wallpaper themes) |
 | **Editor** | `~/.vimrc`, `~/.config/nvim/` (LazyVim), `~/.config/micro/` |
 | **Desktop theme** | `~/.config/gtk-3.0/`, `~/.config/gtk-4.0/`, `~/.config/qt5ct/`, `~/.config/qt6ct/`, `~/.config/nwg-look/`, `kdeglobals`, `xsettingsd`, `mimeapps.list` |
 | **Bars & widgets** | `~/.config/noctalia/`, `~/.config/rofi/`, `~/.config/btop/`, `~/.config/cava/` |
 | **Session / audio** | `~/.config/uwsm/`, `~/.config/wireplumber/`, `~/.config/systemd/user/cliphist-store.service` |
-| **Scripts** | `~/.local/bin/` — screenshot, shell-switch, wallpaper-theme, update-all, rofi-shortcuts, … |
+| **Apps** | `~/.config/swappy/`, `~/.config/qView/`, `~/.config/Thunar/`, `~/.config/kritarc` |
+| **Scripts** | `~/.local/bin/` — screenshot, swappy wrapper, shell-switch, wallpaper-theme, update-all, rofi-shortcuts, compress10mb, session-idle/lock, hypr-plugins, … |
 
 ## Notes
 
@@ -174,6 +179,11 @@ installer (`~/.local/state/dotfiles-backups/`).
   `fish_config` if needed.
 - Some configs contain absolute `/home/zxx` paths. If your username differs,
   adjust them after cloning (notably `hypr/config/autostart.lua`,
-  `hypr/config/binds.lua`, `noctalia/config.toml` and `local/bin/rofi-shortcuts`).
+  `hypr/config/binds.lua`, `hypr/config/plugins.lua`,
+  `noctalia/config.toml`, `hypridle.conf` and `local/bin/rofi-shortcuts`).
+- `~/.local/lib/hyprland/hypredging.so` is a small **prebuilt plugin**
+  (x86-64) compiled against Hyprland 0.57. If Hyprland refuses to load it
+  after a major upgrade, rebuild it or comment out `plugins.lua` and
+  `hypr-plugins` in `autostart.lua`; everything else works without it.
 - Neovim uses [LazyVim](https://lazyvim.github.io/); plugins install
   automatically on first launch.

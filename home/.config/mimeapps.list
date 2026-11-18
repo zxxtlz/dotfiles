@@ -45,3 +45,7 @@ audio/wav=mpv.desktop;
 audio/x-wav=mpv.desktop;
 audio/x-mpegurl=mpv.desktop;
 audio/x-scpls=mpv.desktop;
+x-scheme-handler/lunarclient=lunarclient.desktop
+x-scheme-handler/discord-671636579701358592=lunarclient.desktop
+application/x-hd2a-project=hd2arsenal.desktop
+application/x-hd2a-profile=hd2arsenal.desktop

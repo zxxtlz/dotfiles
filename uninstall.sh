@@ -10,7 +10,7 @@ set -euo pipefail
 REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_DIR="$REPO_DIR/home"
 HOME_DIR="${HOME:?HOME is not set}"
-MERGE_DIRS=(".config" ".local/bin")
+MERGE_DIRS=(".config" ".local/bin" ".local/lib")
 DRY_RUN=0
 
 usage() {

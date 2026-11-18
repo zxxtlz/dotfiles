@@ -1,0 +1,32 @@
+#!/bin/sh
+# session-lock - one lock entry point for idle, suspend and Super+L.
+#
+# The lock belongs to the running desktop shell: Ukishima ships its own
+# Quickshell lockscreen, Noctalia has its own session lock. Both are started
+# detached, because Ukishima's lock.sh runs the lockscreen in the foreground
+# (it is written to be exec'd from a menu) and hypridle's before-sleep hook
+# must not wait for the user to unlock before the machine can sleep.
+
+set -u
+PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+UKISHIMA_DIR="${UKISHIMA_DIR:-$HOME/.local/share/quickshell/ukishima}"
+
+# A lockscreen is already up (idle ladder, or before_sleep while locked).
+# A second Quickshell lock cannot acquire the exclusive ext-session-lock.
+if pgrep -f "$UKISHIMA_DIR/lockscreen/shell.qml" >/dev/null 2>&1; then
+    exit 0
+fi
+
+if pgrep -f "quickshell --path $UKISHIMA_DIR" >/dev/null 2>&1 ||
+    pgrep -f "$UKISHIMA_DIR/launch.sh" >/dev/null 2>&1; then
+    setsid -f "$UKISHIMA_DIR/scripts/lock.sh" >/dev/null 2>&1
+    exit 0
+fi
+
+if pgrep -x noctalia >/dev/null 2>&1; then
+    noctalia msg session lock >/dev/null 2>&1
+    exit 0
+fi
+
+# No known shell: ask logind, which routes to whatever registered a locker.
+loginctl lock-session

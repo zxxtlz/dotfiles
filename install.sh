@@ -23,6 +23,7 @@ HOME_DIR="${HOME:?HOME is not set}"
 MERGE_DIRS=(
   ".config"
   ".local/bin"
+  ".local/lib"
 )
 
 # ---------------------------------------------------------------------------
@@ -56,6 +57,9 @@ REQUIRED_PACKAGES=(
   cliphist
   slurp
   grim
+  swappy
+  wtype
+  hypridle
   jq
   python
   python-pillow
@@ -405,6 +409,26 @@ install_entry() {
   fi
 }
 
+# Configs reference a few tools by absolute path under ~/.local/bin, while the
+# tools themselves are distro packages. Point the expected path at whatever is
+# on PATH, without touching a real file that may already live there.
+link_packaged_bins() {
+  local name target dst
+  for name in hypridle swappy wtype; do
+    dst="$HOME_DIR/.local/bin/$name"
+    [[ -e "$dst" || -L "$dst" ]] && continue
+    target="$(command -v -- "$name" 2>/dev/null || true)"
+    [[ -n "$target" ]] || continue
+    if (( DRY_RUN )); then
+      action "${C_BLUE}would link${C_RESET}" "~/.local/bin/$name -> $target"
+    else
+      mkdir -p -- "$(dirname -- "$dst")"
+      ln -s -- "$target" "$dst"
+      action "${C_GREEN}linked${C_RESET}" "~/.local/bin/$name -> $target"
+    fi
+  done
+}
+
 link_dotfiles() {
   section "Dotfiles"
   echo "  repo:   $REPO_DIR"
@@ -435,6 +459,10 @@ link_dotfiles() {
     esac
     install_entry "$child" "$HOME_DIR/$name"
   done < <(find "$SOURCE_DIR" -mindepth 1 -maxdepth 1 -print0 | sort -z)
+
+  # 3. Some configs call tools by absolute path (~/.local/bin/hypridle).
+  #    Those tools ship as packages, so add the expected link when missing.
+  link_packaged_bins
 
   # Enable the clipboard-history user service, if we are in a user session.
   if (( ! DRY_RUN )) && [[ -f "$HOME_DIR/.config/systemd/user/cliphist-store.service" ]]; then

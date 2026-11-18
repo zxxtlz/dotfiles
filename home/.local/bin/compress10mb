@@ -1,0 +1,823 @@
+#!/usr/bin/env python3
+"""compress10mb - shrink images/videos under a size limit with minimal visible loss.
+
+Strategy
+  Images: keep the original resolution and find the HIGHEST JPEG/WebP quality
+  that still fits under the limit. Only if even a high-quality encode does not
+  fit does it downscale slightly (15% steps) and retry.
+  Videos: two-pass H.264/AAC encode aimed just under the limit. Source
+  resolution/fps are kept unless the bitrate budget is too small for the
+  resolution, in which case it steps down 4K -> 1080p -> 720p -> 480p.
+
+Usage
+  compress10mb [options] FILE [FILE...]
+  compress10mb                      terminal picker (fzf) over recent media
+  compress10mb --pick               GUI file picker (zenity)
+  compress10mb --clipboard          compress the image / file path in the clipboard
+
+Options
+  --limit MB        size limit in megabytes (default 10)
+  --format FMT      image output: auto|jpg|webp|avif   (default auto)
+  --codec CODEC     video codec: h264|hevc             (default h264)
+  --fast            videos: use NVENC (much faster, slightly lower quality)
+  --preset P        x264 preset for videos (default slow)
+  --output DIR      write results to DIR instead of next to the source
+  --force           recompress even if the file is already under the limit
+  --quiet           only print the result line, no progress chatter
+"""
+from __future__ import annotations
+
+import json
+import mimetypes
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path.home()
+XDG_PICTURES = Path(os.environ.get("XDG_PICTURES_DIR") or HOME / "Pictures")
+XDG_VIDEOS = Path(os.environ.get("XDG_VIDEOS_DIR") or HOME / "Videos")
+XDG_DOWNLOAD = Path(os.environ.get("XDG_DOWNLOAD_DIR") or HOME / "Downloads")
+CACHE = Path(os.environ.get("XDG_CACHE_HOME") or HOME / ".cache") / "compress10mb"
+LOG = CACHE / "log"
+STATUS = CACHE / "status.json"
+
+IMAGE_EXTS = {"jpg", "jpeg", "png", "webp", "avif", "bmp", "tif", "tiff",
+              "heic", "heif", "jxl", "jfif", "gif"}
+VIDEO_EXTS = {"mp4", "m4v", "mov", "mkv", "webm", "avi", "mpg", "mpeg",
+              "ts", "m2ts", "wmv", "flv", "3gp", "ogv", "gif", "webp"}
+
+FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
+FFPROBE = shutil.which("ffprobe") or "ffprobe"
+MAGICK = shutil.which("magick") or shutil.which("convert") or "convert"
+
+MIN_QUALITY = {"jpg": 80, "webp": 80, "avif": 62}
+SCALE_STEP = 0.85
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+def mb(n: float) -> str:
+    return f"{n / 1_000_000:.2f} MB"
+
+
+def log(msg: str) -> None:
+    try:
+        CACHE.mkdir(parents=True, exist_ok=True)
+        with LOG.open("a", encoding="utf-8") as fh:
+            fh.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}\n")
+    except OSError:
+        pass
+
+
+def run(cmd: list[str], timeout: float | None = None,
+        stdin_text: str | None = None) -> tuple[int, str, str]:
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           input=stdin_text)
+        return p.returncode, p.stdout, p.stderr
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 127, "", str(exc)
+
+
+def notify(title: str, body: str) -> None:
+    if not shutil.which("notify-send"):
+        return
+    run(["notify-send", "-a", "compress10mb", title, body], timeout=10)
+
+
+def say(msg: str, quiet: bool = False) -> None:
+    if quiet:
+        return
+    print(msg, flush=True)
+
+
+class Reporter:
+    """Publish live progress for the shell widgets (Ukishima pill, Noctalia).
+
+    The state is a tiny JSON file rewritten at most a few times a second and
+    refreshed once a second by a daemon thread, so a shell can tell a running
+    job from one that was killed by the `updated` timestamp alone. Writes go
+    through a temp file plus rename, so a reader never sees half a document.
+    """
+
+    MIN_INTERVAL = 0.35
+    # A Noctalia OSD is a process spawn, and the bar already renders every
+    # percentage tick; refreshing it about once a second is plenty.
+    OSD_INTERVAL = 1.2
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._wlock = threading.Lock()
+        self._olock = threading.Lock()
+        self._state: dict | None = None
+        self._last = 0.0
+        self._osd_last = 0.0
+        self._osd_ok: bool | None = None
+        threading.Thread(target=self._heartbeat, daemon=True).start()
+
+    def begin(self, label: str, index: int, total: int) -> None:
+        with self._lock:
+            self._state = {"active": True, "ok": False, "pid": os.getpid(),
+                           "label": label, "index": index, "total": total,
+                           "percent": 0.0, "phase": "preparing",
+                           "updated": time.time()}
+        self._write(force=True)
+        self._osd(force=True)
+
+    def update(self, percent: float | None = None,
+               phase: str | None = None) -> None:
+        with self._lock:
+            if not self._state or not self._state.get("active"):
+                return
+            if percent is not None:
+                self._state["percent"] = round(max(0.0, min(100.0, percent)), 1)
+            if phase is not None:
+                self._state["phase"] = phase
+            self._state["updated"] = time.time()
+            snapshot = dict(self._state)
+        self._write(snapshot)
+        self._osd()
+
+    def finish(self, ok: bool, summary: str = "") -> None:
+        """Publish the final state, or stay silent if the file was skipped."""
+        with self._lock:
+            if self._state is None:
+                return
+            self._state.update({"active": False, "ok": ok, "summary": summary,
+                                "percent": 100.0 if ok else self._state.get("percent", 0.0),
+                                "updated": time.time()})
+            snapshot = dict(self._state)
+        self._write(snapshot, force=True)
+        self._osd(force=True)
+
+    def _heartbeat(self) -> None:
+        while True:
+            time.sleep(1.0)
+            with self._lock:
+                if not self._state or not self._state.get("active"):
+                    continue
+                self._state["updated"] = time.time()
+                snapshot = dict(self._state)
+            self._write(snapshot, force=True)
+            # The OSD fades on its own after a couple of seconds, so keep it
+            # topped up while the job runs (a slow image encode makes no
+            # progress calls between steps).
+            self._osd()
+
+    def _noctalia_running(self) -> bool:
+        if self._osd_ok is None:
+            self._osd_ok = False
+            if shutil.which("noctalia"):
+                try:
+                    self._osd_ok = subprocess.run(
+                        ["pgrep", "-x", "noctalia"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        timeout=2).returncode == 0
+                except (OSError, subprocess.SubprocessError):
+                    pass
+        return self._osd_ok
+
+    def _osd(self, force: bool = False) -> None:
+        """Mirror the job onto Noctalia's OSD when that shell is the running one.
+
+        Ukishima reads status.json directly, so this path is skipped entirely
+        there: no extra process, no log noise, and nothing to go stale.
+        """
+        if not self._noctalia_running():
+            return
+        with self._lock:
+            if not self._state:
+                return
+            state = dict(self._state)
+        now = time.time()
+        with self._olock:
+            if not force and now - self._osd_last < self.OSD_INTERVAL:
+                return
+            self._osd_last = now
+        label = state.get("label") or "compress10mb"
+        if len(label) > 28:
+            label = label[:27] + "\u2026"
+        pct = float(state.get("percent") or 0.0)
+        if state.get("active"):
+            text, inactive = f"{label} \u00b7 {pct:.0f}%", False
+        elif state.get("ok"):
+            text, inactive = f"{label} \u00b7 done", True
+        else:
+            text, inactive = f"{label} \u00b7 failed", True
+        payload = {"icon": "file-zip", "value": text,
+                   "progress": round(max(0.0, min(1.0, pct / 100)), 3)}
+        if inactive:
+            payload["inactive"] = True
+        try:
+            subprocess.Popen(["noctalia", "msg", "osd-show",
+                              json.dumps(payload, ensure_ascii=False)],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        except OSError:
+            self._osd_ok = False
+
+    def _write(self, state: dict | None = None, force: bool = False) -> None:
+        if state is None:
+            return
+        now = time.time()
+        if not force and now - self._last < self.MIN_INTERVAL:
+            return
+        self._last = now
+        try:
+            with self._wlock:
+                CACHE.mkdir(parents=True, exist_ok=True)
+                tmp = STATUS.with_name(f"status.{os.getpid()}.tmp")
+                tmp.write_text(json.dumps(state), encoding="utf-8")
+                os.replace(tmp, STATUS)
+        except OSError:
+            pass
+
+
+def unique_target(path: Path, stem_suffix: str, ext: str) -> Path:
+    base = path.with_name(f"{path.stem}{stem_suffix}")
+    candidate = base.with_suffix(f".{ext}")
+    n = 1
+    while candidate.exists():
+        candidate = path.with_name(f"{path.stem}{stem_suffix}_{n}").with_suffix(f".{ext}")
+        n += 1
+    return candidate
+
+
+def output_dir(src: Path, explicit: str | None) -> Path:
+    if explicit:
+        d = Path(explicit).expanduser()
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    return src.parent
+
+
+def image_frames(path: Path) -> int:
+    rc, out, _ = run([MAGICK, "identify", "-format", "%n\n", str(path)], timeout=60)
+    try:
+        return max(int(x) for x in out.split() if x.strip())
+    except ValueError:
+        return 1
+
+
+def is_animated(path: Path) -> bool:
+    return image_frames(path) > 1
+
+
+def kind_of(path: Path) -> str:
+    ext = path.suffix.lower().lstrip(".")
+    if ext in ("gif", "webp"):
+        return "video" if is_animated(path) else "image"
+    if ext in IMAGE_EXTS:
+        return "image"
+    if ext in VIDEO_EXTS:
+        return "video"
+    mime = mimetypes.guess_type(str(path))[0] or ""
+    if mime.startswith("image/"):
+        return "video" if is_animated(path) else "image"
+    return "video"
+
+
+def image_props(path: Path) -> dict:
+    # -ping reads only the header; %A reports whether an alpha channel exists
+    # (False/Undefined - which is what RGB images report - mean no alpha).
+    rc, out, _ = run([MAGICK, "identify", "-ping", "-format", "%w %h %A",
+                      str(path)], timeout=60)
+    if rc != 0:
+        raise RuntimeError(f"cannot read image: {path}")
+    parts = out.split()
+    alpha = len(parts) >= 3 and parts[2] not in ("False", "Undefined", "None", "")
+    return {"w": int(parts[0]), "h": int(parts[1]), "alpha": alpha}
+
+
+def probe(path: Path) -> dict:
+    rc, out, err = run([FFPROBE, "-v", "error", "-print_format", "json",
+                        "-show_format", "-show_streams", str(path)], timeout=60)
+    if rc != 0:
+        raise RuntimeError(f"ffprobe failed: {err.strip()[:200]}")
+    return json.loads(out)
+
+
+def rotation_of(stream: dict) -> int:
+    for sd in stream.get("side_data_list", []):
+        if "rotation" in sd:
+            try:
+                return int(float(sd["rotation"]))
+            except (TypeError, ValueError):
+                pass
+    try:
+        return int(float(stream.get("tags", {}).get("rotate", 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# images
+# ---------------------------------------------------------------------------
+
+def encode_image(src: Path, dst: Path, fmt: str, quality: int,
+                 width: int | None) -> None:
+    cmd = [MAGICK, str(src), "-auto-orient", "-colorspace", "sRGB"]
+    if width and width > 0:
+        cmd += ["-resize", f"{width}x"]  # height follows aspect ratio
+    cmd += ["-strip"]
+    if fmt == "jpg":
+        cmd += ["-sampling-factor", "4:4:4"]
+    elif fmt == "webp":
+        # method=2 is ~6x faster than method=6 on big images for ~1.5% larger
+        # output; the quality search makes that difference irrelevant.
+        cmd += ["-define", "webp:method=2", "-define", "webp:alpha-quality=100"]
+    elif fmt == "avif":
+        cmd += ["-define", "heic:speed=6"]
+    cmd += ["-quality", str(quality), str(dst)]
+    rc, _, err = run(cmd, timeout=900)
+    if rc != 0 or not dst.exists() or dst.stat().st_size == 0:
+        raise RuntimeError(f"image encode failed: {err.strip()[:200]}")
+
+
+def compress_image(src: Path, out_dir: Path, limit: int, fmt_pref: str,
+                   force: bool, quiet: bool,
+                   reporter: Reporter | None = None) -> tuple[Path, int, int]:
+    size = src.stat().st_size
+    if size <= limit and not force:
+        say(f"  {src.name}: already under the limit ({mb(size)}) - skipped")
+        return src, size, size
+
+    props = image_props(src)
+    fmt = fmt_pref
+    if fmt == "auto":
+        fmt = "webp" if props["alpha"] else "jpg"
+    if fmt == "jpeg":
+        fmt = "jpg"
+    min_q = MIN_QUALITY.get(fmt, 80)
+
+    target = unique_target(out_dir / src.name, "_10mb", fmt)
+    tmp = CACHE / f"encode-{os.getpid()}.{fmt}"
+    CACHE.mkdir(parents=True, exist_ok=True)
+
+    # Each resolution level owns a slice of the bar; the first level normally
+    # finishes the job, so it gets most of the range and extra downscales walk
+    # the rest. A level is at most about eleven encodes (probe at 100, probe at
+    # the minimum, up to seven binary steps, one final write), which keeps the
+    # bar honest without needing a second pass over the image.
+    bands = [(0.0, 70.0), (70.0, 88.0), (88.0, 95.0), (95.0, 98.5),
+             (98.5, 99.5)]
+    encodes = 0
+    level = 0
+
+    def enc(quality: int, dest: Path, width: int, phase: str) -> None:
+        nonlocal encodes
+        encodes += 1
+        if reporter:
+            lo, hi = bands[min(level, len(bands) - 1)]
+            reporter.update(lo + (hi - lo) * min(1.0, encodes / 11), phase)
+        encode_image(src, dest, fmt, quality, width if scale < 1.0 else None)
+
+    scale = 1.0
+    width = props["w"]
+    for attempt in range(14):
+        level = attempt
+        encodes = 0
+        width = max(64, int(props["w"] * scale))
+        # Quality 100 first: if the untouched image already fits, use it.
+        enc(100, tmp, width, "checking size")
+        if tmp.stat().st_size <= limit:
+            enc(100, target, width, "writing")
+            final_q_msg = 100
+            break
+
+        # Does even the minimum acceptable quality fit at this resolution?
+        enc(min_q, tmp, width, "checking quality")
+        if tmp.stat().st_size > limit:
+            scale *= SCALE_STEP
+            say(f"  {src.name}: {props['w']}px too much for the limit, "
+                f"trying {int(props['w'] * scale)}px")
+            continue
+
+        # Binary search the highest quality that still fits.
+        lo, hi, best = min_q, 99, min_q
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            enc(mid, tmp, width, "searching quality")
+            if tmp.stat().st_size <= limit:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        final_q = best
+        for _ in range(5):  # never ship something over the limit
+            enc(final_q, target, width, "writing")
+            if target.stat().st_size <= limit:
+                break
+            final_q -= 1
+            if final_q < 1:
+                raise RuntimeError("could not fit the image under the limit")
+        final_q_msg = final_q
+        break
+    else:
+        raise RuntimeError("could not fit the image under the limit")
+
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+
+    out_size = target.stat().st_size
+    details = f"quality {final_q_msg}, {width}px wide, {fmt.upper()}"
+    say(f"  {src.name}: {mb(size)} -> {mb(out_size)} ({details})")
+    log(f"image {src} -> {target} ({details})")
+    return target, size, out_size
+
+
+# ---------------------------------------------------------------------------
+# videos
+# ---------------------------------------------------------------------------
+
+def video_plan(info: dict, limit: int) -> dict:
+    fmt = info.get("format", {})
+    duration = float(fmt.get("duration") or 0)
+    if duration <= 0.5:
+        raise RuntimeError("cannot read the video duration")
+
+    vstream = next((s for s in info["streams"] if s.get("codec_type") == "video"), None)
+    if not vstream:
+        raise RuntimeError("no video stream found")
+    astream = next((s for s in info["streams"] if s.get("codec_type") == "audio"), None)
+
+    w, h = int(vstream.get("width") or 0), int(vstream.get("height") or 0)
+    if abs(rotation_of(vstream)) % 180 == 90:
+        w, h = h, w
+
+    # limit is in bytes (already MB -> bytes in main()).
+    budget = limit * 8 * 0.97  # bits, 3% container margin
+    abr = 128
+    if duration > 600:
+        abr = 96
+    if duration > 1800:
+        abr = 64
+    if astream is None:
+        abr = 0
+    if budget - abr * 1000 * duration < duration * 300_000:
+        abr = 64 if astream else 0
+    if astream and budget - abr * 1000 * duration < duration * 120_000:
+        abr = 48
+
+    vbit = int(max(40_000, (budget - abr * 1000 * duration) / duration))
+    vbit = min(vbit, 50_000_000)
+
+    # Downscale only when the budget per pixel gets too tight.
+    short = min(w, h)
+    cap_h = h
+    tier = "source"
+    if vbit < 2_500_000 and short > 1080:
+        cap_h, tier = 1080, "1080p"
+    if vbit < 1_200_000 and short > 720:
+        cap_h, tier = 720, "720p"
+    if vbit < 450_000 and short > 480:
+        cap_h, tier = 480, "480p"
+
+    scale = None
+    if cap_h < short:
+        ratio = cap_h / short
+        tw = max(2, int(w * ratio) // 2 * 2)
+        th = max(2, int(h * ratio) // 2 * 2)
+        scale = f"scale={tw}:{th}"
+    elif w % 2 or h % 2:
+        scale = f"scale={w // 2 * 2}:{h // 2 * 2}"
+
+    return {"duration": duration, "vbit": vbit, "abr": abr, "scale": scale,
+            "tier": tier, "has_audio": astream is not None,
+            "size": int(fmt.get("size") or 0)}
+
+
+def run_ffmpeg_progress(cmd: list[str], duration: float,
+                        progress=None) -> tuple[int, str]:
+    """Run ffmpeg with machine-readable progress on stdout.
+
+    ffmpeg reports `out_time_ms` in microseconds (a long-standing quirk) and
+    also emits `out_time_us`, so both feed the same seconds value.
+    """
+    full = cmd[:1] + ["-progress", "pipe:1", "-nostats"] + cmd[1:]
+    with tempfile.TemporaryFile("w+") as errf:
+        try:
+            proc = subprocess.Popen(full, stdout=subprocess.PIPE,
+                                    stderr=errf, text=True)
+        except OSError as exc:
+            return 127, str(exc)
+        if proc.stdout is not None:
+            for line in proc.stdout:
+                key, _, value = line.strip().partition("=")
+                if (progress and duration > 0
+                        and key in ("out_time_us", "out_time_ms")):
+                    try:
+                        secs = int(value) / 1_000_000
+                    except ValueError:
+                        continue
+                    progress(max(0.0, min(1.0, secs / duration)))
+        rc = proc.wait()
+        errf.seek(0)
+        return rc, errf.read()
+
+
+def video_encode(src: Path, target: Path, plan: dict, codec: str,
+                 fast: bool, preset: str, passlog: Path,
+                 progress=None, on_pass=None) -> None:
+    scale = ["-vf", plan["scale"]] if plan["scale"] else []
+    venc = {"h264": "libx264", "hevc": "libx265"}[codec]
+    if fast:
+        venc = {"h264": "h264_nvenc", "hevc": "hevc_nvenc"}[codec]
+    vbit = f'{max(30, plan["vbit"] // 1000)}k'
+
+    if fast:
+        cmd = [FFMPEG, "-nostdin", "-y", "-i", str(src), "-map", "0:v:0"]
+        if plan["has_audio"]:
+            cmd += ["-map", "0:a:0?"]
+        cmd += scale + ["-c:v", venc, "-preset", "p6", "-tune", "hq",
+                        "-rc", "vbr", "-b:v", vbit,
+                        "-maxrate", f'{int(plan["vbit"] * 1.5) // 1000}k',
+                        "-bufsize", f'{int(plan["vbit"] * 2) // 1000}k']
+        if plan["abr"]:
+            cmd += ["-c:a", "aac", "-b:a", f'{plan["abr"]}k']
+        else:
+            cmd += ["-an"]
+        if codec == "hevc":
+            cmd += ["-tag:v", "hvc1"]
+        cmd += ["-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                "-map_metadata", "0", str(target)]
+        if on_pass:
+            on_pass("encoding")
+        rc, err = run_ffmpeg_progress(cmd, plan["duration"], progress)
+        if rc != 0:
+            raise RuntimeError(f"encode failed: {err.strip().splitlines()[-1][:200]}")
+        return
+
+    common = [FFMPEG, "-nostdin", "-y", "-i", str(src), "-map", "0:v:0"] + scale
+    pass1 = common + ["-c:v", venc, "-preset", preset, "-b:v", vbit,
+                      "-pass", "1", "-passlogfile", str(passlog), "-an"]
+    if codec == "hevc":
+        pass1 += ["-tag:v", "hvc1"]
+    pass1 += ["-f", "null", "-"]
+    if on_pass:
+        on_pass("pass 1 of 2")
+    half = (lambda f: progress(f * 0.5)) if progress else None
+    rc, err = run_ffmpeg_progress(pass1, plan["duration"], half)
+    if rc != 0:
+        raise RuntimeError(f"pass 1 failed: {err.strip().splitlines()[-1][:200]}")
+
+    pass2 = [FFMPEG, "-nostdin", "-y", "-i", str(src), "-map", "0:v:0"]
+    if plan["has_audio"]:
+        pass2 += ["-map", "0:a:0?"]
+    pass2 += scale + ["-c:v", venc, "-preset", preset, "-b:v", vbit,
+                      "-pass", "2", "-passlogfile", str(passlog)]
+    if codec == "hevc":
+        pass2 += ["-tag:v", "hvc1"]
+    if plan["abr"]:
+        pass2 += ["-c:a", "aac", "-b:a", f'{plan["abr"]}k']
+    else:
+        pass2 += ["-an"]
+    pass2 += ["-pix_fmt", "yuv420p", "-movflags", "+faststart",
+              "-map_metadata", "0", str(target)]
+    if on_pass:
+        on_pass("pass 2 of 2")
+    second = (lambda f: progress(0.5 + f * 0.5)) if progress else None
+    rc, err = run_ffmpeg_progress(pass2, plan["duration"], second)
+    if rc != 0:
+        raise RuntimeError(f"pass 2 failed: {err.strip().splitlines()[-1][:200]}")
+
+
+def compress_video(src: Path, out_dir: Path, limit: int, codec: str,
+                   fast: bool, preset: str, force: bool,
+                   quiet: bool,
+                   reporter: Reporter | None = None) -> tuple[Path, int, int]:
+    size = src.stat().st_size
+    if size <= limit and not force:
+        say(f"  {src.name}: already under the limit ({mb(size)}) - skipped")
+        return src, size, size
+
+    info = probe(src)
+    plan = video_plan(info, limit)
+    target = unique_target(out_dir / src.name, "_10mb", "mp4")
+    passlog = Path(tempfile.mkdtemp(prefix="c10-", dir="/tmp/opencode")) / "ff"
+    say(f"  {src.name}: {mb(size)}, {plan['duration']:.1f}s -> "
+        f"{max(30, plan['vbit'] // 1000)} kbps video @ {plan['tier']}")
+
+    try:
+        # The first encode owns 85% of the bar; the (rare) bitrate retries walk
+        # the remaining slices so the bar never jumps backwards.
+        bands = [(0.0, 85.0), (85.0, 93.0), (93.0, 97.0), (97.0, 99.0),
+                 (99.0, 99.5)]
+        for attempt in range(5):
+            lo, hi = bands[min(attempt, len(bands) - 1)]
+
+            def on_progress(f: float, lo: float = lo, hi: float = hi) -> None:
+                if reporter:
+                    reporter.update(lo + (hi - lo) * f)
+
+            def on_pass(phase: str, lo: float = lo) -> None:
+                if reporter:
+                    reporter.update(lo, phase)
+
+            video_encode(src, target, plan, codec, fast, preset, passlog,
+                         on_progress, on_pass)
+            out_size = target.stat().st_size
+            if out_size <= limit:
+                break
+            ratio = (limit * 0.97) / out_size
+            plan["vbit"] = max(30_000, int(plan["vbit"] * ratio))
+            say(f"  {src.name}: {mb(out_size)} is over, retrying at "
+                f"{plan['vbit'] // 1000} kbps")
+        else:
+            raise RuntimeError("could not fit the video under the limit")
+    finally:
+        shutil.rmtree(passlog.parent, ignore_errors=True)
+
+    out_size = target.stat().st_size
+    details = (f"{codec.upper()}{' (NVENC)' if fast else ''}, "
+               f"{plan['vbit'] // 1000} kbps, {plan['tier']}")
+    say(f"  {src.name}: {mb(size)} -> {mb(out_size)} ({details})")
+    log(f"video {src} -> {target} ({details})")
+    return target, size, out_size
+
+
+# ---------------------------------------------------------------------------
+# pickers / clipboard / main
+# ---------------------------------------------------------------------------
+
+def recent_media() -> list[str]:
+    roots = [XDG_PICTURES, XDG_VIDEOS, XDG_DOWNLOAD, HOME / "Desktop"]
+    expr: list[str] = []
+    for ext in sorted(IMAGE_EXTS | VIDEO_EXTS):
+        if expr:
+            expr.append("-o")
+        expr += ["-iname", f"*.{ext}"]
+    paths: list[str] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        rc, out, _ = run(["find", str(root), "-maxdepth", "3", "-type", "f",
+                          "(", *expr, ")", "-printf", "%T@ %p\n"], timeout=30)
+        paths.extend(out.splitlines())
+    paths.sort(reverse=True)
+    return [p.split(" ", 1)[1] for p in paths if " " in p]
+
+
+def fzf_pick() -> list[str]:
+    items = recent_media()
+    if not items:
+        return []
+    rc, out, _ = run(["fzf", "--multi", "--height=70%", "--reverse",
+                      "--prompt=compress to 10 MB > ",
+                      "--header=Tab to select multiple files"],
+                     stdin_text="\n".join(items))
+    return [line for line in out.splitlines() if line.strip()]
+
+
+def zenity_pick() -> list[str]:
+    filters = ["--file-filter=Media | *.jpg *.jpeg *.png *.webp *.avif *.gif "
+               "*.mp4 *.mov *.mkv *.webm *.avi *.m4v *.ts *.m2ts *.wmv *.flv"]
+    rc, out, _ = run(["zenity", "--file-selection", "--multiple",
+                      "--title=Compress to 10 MB", *filters,
+                      "--filename=" + str(XDG_PICTURES) + "/"],
+                     timeout=None)
+    files: list[str] = []
+    for part in out.replace("\r", "").split("\n"):
+        files += [x for x in part.split("|") if x.strip()]
+    return files
+
+
+def clipboard_pick() -> list[str]:
+    if not shutil.which("wl-paste"):
+        raise RuntimeError("wl-paste is not installed")
+    rc, out, _ = run(["wl-paste", "--list-types"], timeout=10)
+    types = out.split()
+    if rc == 0 and "image/png" in types:
+        dest = XDG_PICTURES / "Compressed"
+        dest.mkdir(parents=True, exist_ok=True)
+        img = dest / f"clipboard_{datetime.now():%Y%m%d_%H%M%S}.png"
+        with img.open("wb") as fh:
+            p = subprocess.run(["wl-paste", "-t", "image/png"], stdout=fh)
+        if p.returncode == 0 and img.stat().st_size > 0:
+            return [str(img)]
+    rc, out, _ = run(["wl-paste", "--no-newline"], timeout=10)
+    text = next((line.strip().strip("'\"") for line in out.splitlines()
+                 if line.strip()), "")
+    if text.startswith("file://"):
+        from urllib.parse import unquote, urlparse
+        text = unquote(urlparse(text).path)
+    if text and Path(text).is_file():
+        return [text]
+    raise RuntimeError("clipboard holds no image or file path")
+
+
+def collect_inputs(args_files: list[str], pick: bool) -> list[Path]:
+    if args_files:
+        return [Path(f).expanduser() for f in args_files]
+    wayland = bool(os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY"))
+    if pick or not sys.stdin.isatty():
+        if wayland and shutil.which("zenity"):
+            return [Path(f).expanduser() for f in zenity_pick()]
+        if not wayland:
+            raise RuntimeError("no graphical session for --pick")
+    return [Path(f).expanduser() for f in fzf_pick()]
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    opts = {"limit": 10.0, "format": "auto", "codec": "h264", "fast": False,
+            "preset": "slow", "output": None, "force": False, "quiet": False,
+            "pick": False, "clipboard": False}
+    files: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        if a == "--limit" and i + 1 < len(argv):
+            opts["limit"] = float(argv[i + 1]); i += 2; continue
+        if a == "--format" and i + 1 < len(argv):
+            opts["format"] = argv[i + 1]; i += 2; continue
+        if a == "--codec" and i + 1 < len(argv):
+            opts["codec"] = argv[i + 1]; i += 2; continue
+        if a == "--preset" and i + 1 < len(argv):
+            opts["preset"] = argv[i + 1]; i += 2; continue
+        if a == "--output" and i + 1 < len(argv):
+            opts["output"] = argv[i + 1]; i += 2; continue
+        if a == "--fast":
+            opts["fast"] = True; i += 1; continue
+        if a == "--force":
+            opts["force"] = True; i += 1; continue
+        if a == "--quiet":
+            opts["quiet"] = True; i += 1; continue
+        if a == "--pick":
+            opts["pick"] = True; i += 1; continue
+        if a == "--clipboard":
+            opts["clipboard"] = True; i += 1; continue
+        files.append(a); i += 1
+
+    limit = int(opts["limit"] * 1_000_000)
+    quiet = opts["quiet"]
+    try:
+        if opts["clipboard"]:
+            inputs = [Path(f) for f in clipboard_pick()]
+        else:
+            inputs = collect_inputs(files, opts["pick"])
+    except RuntimeError as exc:
+        print(f"compress10mb: {exc}", file=sys.stderr)
+        return 1
+    if not inputs:
+        print("compress10mb: no files selected")
+        return 1
+
+    ok = fail = 0
+    reporter = Reporter()
+    total = len(inputs)
+    for n, src in enumerate(inputs, 1):
+        if not src.is_file():
+            print(f"compress10mb: no such file: {src}", file=sys.stderr)
+            fail += 1
+            continue
+        say(f"Compressing {src.name} ({mb(src.stat().st_size)}) ...")
+        started = False
+        try:
+            out_dir = output_dir(src, opts["output"])
+            # Skipped files never start a job, so the pill does not flash a
+            # badge for a file that was already under the limit.
+            if src.stat().st_size > limit or opts["force"]:
+                reporter.begin(src.name, n, total)
+                started = True
+            if kind_of(src) == "image":
+                result, before, after = compress_image(
+                    src, out_dir, limit, opts["format"], opts["force"], quiet,
+                    reporter)
+            else:
+                result, before, after = compress_video(
+                    src, out_dir, limit, opts["codec"], opts["fast"],
+                    opts["preset"], opts["force"], quiet, reporter)
+            ok += 1
+            if started:
+                reporter.finish(True, f"{mb(before)} -> {mb(after)}")
+            if str(result) != str(src):
+                notify("Compressed to 10 MB",
+                       f"{src.name}: {mb(before)} -> {mb(after)}\n{result}")
+        except Exception as exc:  # noqa: BLE001 - show the real reason
+            fail += 1
+            print(f"compress10mb: {src.name}: {exc}", file=sys.stderr)
+            log(f"ERROR {src}: {exc}")
+            if started:
+                reporter.finish(False, str(exc)[:160])
+            notify("Compression failed", f"{src.name}\n{exc}")
+
+    say(f"Done: {ok} compressed, {fail} failed.")
+    return 0 if fail == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

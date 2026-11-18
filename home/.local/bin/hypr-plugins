@@ -1,0 +1,20 @@
+#!/bin/sh
+# hypr-plugins - load user-local Hyprland plugins and set their options.
+#
+# The Lua config declares these with hl.plugin.load (see
+# ~/.config/hypr/config/plugins.lua), but a runtime reload cannot load a new
+# library; this runs at hyprland.start so the plugin is there for the session.
+# It also re-applies the runtime options, which is what makes the plugin usable
+# immediately instead of only after the next config pass.
+
+set -u
+so="$HOME/.local/lib/hyprland/hypredging.so"
+[ -f "$so" ] || exit 0
+
+if ! hyprctl plugin list 2>/dev/null | grep -q "hypredging"; then
+    hyprctl plugin load "$so" >/dev/null 2>&1 || exit 0
+fi
+
+# hyprctl keyword is gone in the Lua-config era; hl.config through eval is the
+# runtime equivalent.
+hyprctl eval 'hl.config({ plugin = { hypredging = { edge_delay_ms = 350, rearm_delay_ms = 350 } } })' >/dev/null 2>&1

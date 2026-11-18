@@ -1431,7 +1431,8 @@ def apply(wallpaper: Path, quiet: bool = False) -> bool:
     write_qt(palette)
     write_legacy_noctalia(palette)
     write_rofi(palette)
-    write_vesktop(palette)
+    # Vesktop/Discord theming intentionally disabled: keep Discord on its
+    # default theme (see ~/.config/hypr/config/windowrules.lua for its opacity).
     write_librewolf(palette)
     write_kitty(palette)
     write_btop(palette)
@@ -1441,7 +1442,7 @@ def apply(wallpaper: Path, quiet: bool = False) -> bool:
         d = palette["dark"]
         mode = "chromatic" if palette["chromatic"] else "monochrome"
         log(f"{wallpaper.name}: {mode}, accent {d['accent']}, surface {d['surface']}")
-        log("updated GTK, KDE, Qt, rofi, Vesktop, LibreWolf, kitty, btop and Hyprland borders")
+        log("updated GTK, KDE, Qt, rofi, LibreWolf, kitty, btop and Hyprland borders")
         if noctalia_running():
             log("Noctalia keeps its own wallpaper-derived palette")
     return True

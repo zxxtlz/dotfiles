@@ -97,7 +97,9 @@ hl.bind(mainMod .. " + Z",          hl.dsp.exec_cmd(noctCall .. "settings-toggle
 hl.bind(mainMod .. " + X",          hl.dsp.exec_cmd(noctCall .. "panel-toggle control-center"))
 hl.bind(mainMod .. " + Space",      hl.dsp.exec_cmd(noctCall .. "panel-toggle launcher"))
 hl.bind(mainMod .. " + period",     hl.dsp.exec_cmd(noctCall .. "panel-toggle launcher /emo"))
-hl.bind(mainMod .. " + L",          hl.dsp.exec_cmd(noctCall .. "session lock"))
+-- Shell-aware: the idle ladder, before-sleep and this bind all lock through
+-- the same entry point (Ukishima's Quickshell lock or Noctalia's own).
+hl.bind(mainMod .. " + L",          hl.dsp.exec_cmd("/home/zxx/.local/bin/session-lock"))
 hl.bind(mainMod .. " + ALT + C",    hl.dsp.exec_cmd(noctCall .. "panel-toggle session"))
 
 ---------------------------
@@ -125,8 +127,8 @@ hl.bind("XF86MonBrightnessDown", hl.dsp.exec_cmd(noctCall .. "brightness-down"),
 -------------------
 
 -- Screen Capture
--- Super+P: region screenshot (saved + copied), Super+Shift+P: colour picker
-hl.bind(mainMod .. " + P",         hl.dsp.exec_cmd("/home/zxx/.local/bin/screenshot region"))
+-- Super+P: freeze frame, select region, then edit/save/copy in swappy
+hl.bind(mainMod .. " + P",         hl.dsp.exec_cmd("/home/zxx/.local/bin/screenshot freeze"))
 hl.bind(mainMod .. " + SHIFT + P", hl.dsp.exec_cmd("hyprpicker -a -n"))
 hl.bind("Print",                   hl.dsp.exec_cmd("/home/zxx/.local/bin/screenshot region"))
 hl.bind(mainMod .. " + Print",     hl.dsp.exec_cmd("/home/zxx/.local/bin/screenshot full"))

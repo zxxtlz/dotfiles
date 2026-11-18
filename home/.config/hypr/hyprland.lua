@@ -12,6 +12,7 @@ require("config.inputs")
 require("config.binds")
 require("config.misc")
 require("config.monitors")
+require("config.plugins")
 require("config.windowrules")
 require("config.workspaces")
 
