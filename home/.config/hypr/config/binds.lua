@@ -127,11 +127,13 @@ hl.bind("XF86MonBrightnessDown", hl.dsp.exec_cmd(noctCall .. "brightness-down"),
 -------------------
 
 -- Screen Capture
--- Super+P: freeze frame, select region, then edit/save/copy in swappy
-hl.bind(mainMod .. " + P",         hl.dsp.exec_cmd("/home/zxx/.local/bin/screenshot freeze"))
+-- Omasnap grabs the monitor before its overlay maps, so selection happens on
+-- a frozen frame; the overlay editor then handles Copy / Save / Copy+Save.
+-- The same key toggles the overlay closed.
+hl.bind(mainMod .. " + P",         hl.dsp.exec_cmd("/home/zxx/.local/bin/omasnap --editor overlay"))
 hl.bind(mainMod .. " + SHIFT + P", hl.dsp.exec_cmd("hyprpicker -a -n"))
-hl.bind("Print",                   hl.dsp.exec_cmd("/home/zxx/.local/bin/screenshot region"))
-hl.bind(mainMod .. " + Print",     hl.dsp.exec_cmd("/home/zxx/.local/bin/screenshot full"))
+hl.bind("Print",                   hl.dsp.exec_cmd("/home/zxx/.local/bin/omasnap --capture-region --editor overlay"))
+hl.bind(mainMod .. " + Print",     hl.dsp.exec_cmd("/home/zxx/.local/bin/omasnap --capture-fullscreen --editor overlay"))
 
 -- Theming and Wallpaper
 hl.bind(mainMod .. " + SHIFT + W", hl.dsp.exec_cmd(ukCall .. "wallpaper \"\""))
@@ -190,11 +192,12 @@ hl.bind(mainMod .. " + SHIFT + U", hl.dsp.exec_cmd("/home/zxx/.local/bin/shell-s
 ---- KEYBOARD LAYOUT EN <-> BG ----
 ---------------------------------
 
--- Super+K cycles the keyboard layouts configured in inputs.lua
--- (English -> Bulgarian Phonetic -> English).
--- Bound by keycode (45 = physical K key) so it keeps working while the
--- Bulgarian layout is active, where that position emits a different keysym.
-hl.bind(mainMod .. " + code:45", hl.dsp.exec_cmd("hyprctl switchxkblayout current next"))
+-- Super+K toggles English <-> Bulgarian Phonetic (configured in inputs.lua).
+-- The helper sets every keyboard to the opposite layout, so controller
+-- virtual keyboards cannot end up out of sync with the main keyboard.
+-- Bound by keycode (45 = physical K key) since Bulgarian uses that position
+-- for a different keysym.
+hl.bind(mainMod .. " + code:45", hl.dsp.exec_cmd("/home/zxx/.local/bin/toggle-layout"))
 
 ---------------------------
 ---- UKISHIMA CONTROLS ----

@@ -172,3 +172,14 @@ hl.layer_rule({
 	blur = true,
 	blur_popups = true,
 })
+
+-- Omasnap screenshot overlay: no slide/fade so the grab and the frozen
+-- selection frame appear in one step. Never add no_screen_share here:
+-- Hyprland blacks out excluded layers in captures, which breaks scroll shots.
+hl.layer_rule({
+	name = "omasnap",
+	match = {
+		namespace = "^omasnap$",
+	},
+	no_anim = true,
+})

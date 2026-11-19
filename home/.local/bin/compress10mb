@@ -12,11 +12,13 @@ Strategy
 Usage
   compress10mb [options] FILE [FILE...]
   compress10mb                      terminal picker (fzf) over recent media
-  compress10mb --pick               GUI file picker (zenity)
+  compress10mb --pick               GUI: choose a size, then pick files
+  compress10mb --gui                same as --pick
   compress10mb --clipboard          compress the image / file path in the clipboard
 
 Options
-  --limit MB        size limit in megabytes (default 10)
+  --limit MB        size limit in megabytes (default 10). Given explicitly,
+                    it skips the size dialog (also with --pick).
   --format FMT      image output: auto|jpg|webp|avif   (default auto)
   --codec CODEC     video codec: h264|hevc             (default h264)
   --fast            videos: use NVENC (much faster, slightly lower quality)
@@ -66,6 +68,11 @@ SCALE_STEP = 0.85
 
 def mb(n: float) -> str:
     return f"{n / 1_000_000:.2f} MB"
+
+
+def size_tag(limit_bytes: int) -> str:
+    """Short label for a byte limit: 10 MB -> '10', 2.5 MB -> '2.5'."""
+    return f"{limit_bytes / 1_000_000:g}"
 
 
 def log(msg: str) -> None:
@@ -358,7 +365,7 @@ def compress_image(src: Path, out_dir: Path, limit: int, fmt_pref: str,
         fmt = "jpg"
     min_q = MIN_QUALITY.get(fmt, 80)
 
-    target = unique_target(out_dir / src.name, "_10mb", fmt)
+    target = unique_target(out_dir / src.name, f"_{size_tag(limit)}mb", fmt)
     tmp = CACHE / f"encode-{os.getpid()}.{fmt}"
     CACHE.mkdir(parents=True, exist_ok=True)
 
@@ -603,7 +610,7 @@ def compress_video(src: Path, out_dir: Path, limit: int, codec: str,
 
     info = probe(src)
     plan = video_plan(info, limit)
-    target = unique_target(out_dir / src.name, "_10mb", "mp4")
+    target = unique_target(out_dir / src.name, f"_{size_tag(limit)}mb", "mp4")
     passlog = Path(tempfile.mkdtemp(prefix="c10-", dir="/tmp/opencode")) / "ff"
     say(f"  {src.name}: {mb(size)}, {plan['duration']:.1f}s -> "
         f"{max(30, plan['vbit'] // 1000)} kbps video @ {plan['tier']}")
@@ -668,22 +675,129 @@ def recent_media() -> list[str]:
     return [p.split(" ", 1)[1] for p in paths if " " in p]
 
 
-def fzf_pick() -> list[str]:
+def zenity_limit(default: float = 10.0) -> float | None:
+    """Fallback size picker for systems without GTK: scale, then exact entry."""
+    rc, out, _ = run(["zenity", "--scale", f"--value={default}",
+                      "--min-value=0.5", "--max-value=200", "--step=0.5",
+                      "--text=Maximum file size in MB",
+                      "--title=Compress media - target size"], timeout=None)
+    if rc != 0:
+        return None
+    try:
+        value = float(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        value = default
+    rc, out, _ = run(["zenity", "--entry", f"--entry-text={value:g}",
+                      "--text=Exact size in MB (edit if needed)",
+                      "--title=Compress media - target size"], timeout=None)
+    if rc != 0:
+        return None
+    try:
+        return max(0.5, min(200.0, float(out.strip().splitlines()[-1])))
+    except (ValueError, IndexError):
+        return value
+
+
+def gui_limit(default: float = 10.0) -> float | None:
+    """One GTK dialog with a slider AND an exact value field.
+
+    Both controls stay in sync, and a few common sizes are one click away.
+    Returns the chosen size in MB, or None when cancelled.
+    """
+    try:
+        import gi
+        gi.require_version("Gtk", "3.0")
+        from gi.repository import Gtk
+    except Exception:
+        return zenity_limit(default)
+
+    chosen: list[float | None] = [None]
+    dialog = Gtk.Dialog(title="Compress media - target size",
+                        buttons=("_Cancel", Gtk.ResponseType.CANCEL,
+                                 "_Compress", Gtk.ResponseType.OK))
+    dialog.set_default_size(480, -1)
+    dialog.set_resizable(False)
+
+    area = dialog.get_content_area()
+    area.set_spacing(12)
+    area.set_border_width(18)
+
+    title = Gtk.Label(label="Choose the maximum file size")
+    title.set_xalign(0.0)
+    area.pack_start(title, False, False, 0)
+
+    scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL,
+                                     0.5, 200.0, 0.5)
+    scale.set_digits(1)
+    scale.set_value(default)
+    scale.set_draw_value(True)
+    area.pack_start(scale, False, False, 0)
+
+    spin = Gtk.SpinButton.new_with_range(0.5, 200.0, 0.5)
+    spin.set_digits(1)
+    spin.set_value(default)
+    area.pack_start(spin, False, False, 0)
+
+    presets = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+    for value in (2.0, 5.0, 10.0, 25.0, 50.0):
+        btn = Gtk.Button(label=f"{value:g} MB")
+        btn.connect("clicked", lambda _b, v=value: (
+            scale.set_value(v), spin.set_value(v)))
+        presets.pack_start(btn, True, True, 0)
+    area.pack_start(presets, False, False, 0)
+
+    hint = Gtk.Label(label="Files already under this size are left untouched.")
+    hint.set_xalign(0.0)
+    hint.get_style_context().add_class("dim-label")
+    area.pack_start(hint, False, False, 0)
+
+    busy = [False]
+
+    def on_scale(_widget):
+        if busy[0]:
+            return
+        busy[0] = True
+        spin.set_value(round(scale.get_value(), 1))
+        busy[0] = False
+
+    def on_spin(_widget):
+        if busy[0]:
+            return
+        busy[0] = True
+        scale.set_value(max(0.5, min(200.0, spin.get_value())))
+        busy[0] = False
+
+    scale.connect("value-changed", on_scale)
+    spin.connect("value-changed", on_spin)
+
+    ok_button = dialog.get_widget_for_response(Gtk.ResponseType.OK)
+    if ok_button:
+        dialog.set_default(ok_button)
+
+    dialog.show_all()
+    response = dialog.run()
+    if response == Gtk.ResponseType.OK:
+        chosen[0] = round(spin.get_value(), 1)
+    dialog.destroy()
+    return chosen[0]
+
+
+def fzf_pick(limit_mb: float) -> list[str]:
     items = recent_media()
     if not items:
         return []
     rc, out, _ = run(["fzf", "--multi", "--height=70%", "--reverse",
-                      "--prompt=compress to 10 MB > ",
+                      f"--prompt=compress to {limit_mb:g} MB > ",
                       "--header=Tab to select multiple files"],
                      stdin_text="\n".join(items))
     return [line for line in out.splitlines() if line.strip()]
 
 
-def zenity_pick() -> list[str]:
+def zenity_pick(limit_mb: float) -> list[str]:
     filters = ["--file-filter=Media | *.jpg *.jpeg *.png *.webp *.avif *.gif "
                "*.mp4 *.mov *.mkv *.webm *.avi *.m4v *.ts *.m2ts *.wmv *.flv"]
     rc, out, _ = run(["zenity", "--file-selection", "--multiple",
-                      "--title=Compress to 10 MB", *filters,
+                      f"--title=Compress to {limit_mb:g} MB", *filters,
                       "--filename=" + str(XDG_PICTURES) + "/"],
                      timeout=None)
     files: list[str] = []
@@ -716,23 +830,24 @@ def clipboard_pick() -> list[str]:
     raise RuntimeError("clipboard holds no image or file path")
 
 
-def collect_inputs(args_files: list[str], pick: bool) -> list[Path]:
+def collect_inputs(args_files: list[str], pick: bool, limit_mb: float) -> list[Path]:
     if args_files:
         return [Path(f).expanduser() for f in args_files]
     wayland = bool(os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY"))
     if pick or not sys.stdin.isatty():
         if wayland and shutil.which("zenity"):
-            return [Path(f).expanduser() for f in zenity_pick()]
+            return [Path(f).expanduser() for f in zenity_pick(limit_mb)]
         if not wayland:
             raise RuntimeError("no graphical session for --pick")
-    return [Path(f).expanduser() for f in fzf_pick()]
+    return [Path(f).expanduser() for f in fzf_pick(limit_mb)]
 
 
 def main() -> int:
     argv = sys.argv[1:]
     opts = {"limit": 10.0, "format": "auto", "codec": "h264", "fast": False,
             "preset": "slow", "output": None, "force": False, "quiet": False,
-            "pick": False, "clipboard": False}
+            "pick": False, "gui": False, "clipboard": False}
+    limit_given = False
     files: list[str] = []
     i = 0
     while i < len(argv):
@@ -741,7 +856,8 @@ def main() -> int:
             print(__doc__)
             return 0
         if a == "--limit" and i + 1 < len(argv):
-            opts["limit"] = float(argv[i + 1]); i += 2; continue
+            opts["limit"] = float(argv[i + 1]); limit_given = True
+            i += 2; continue
         if a == "--format" and i + 1 < len(argv):
             opts["format"] = argv[i + 1]; i += 2; continue
         if a == "--codec" and i + 1 < len(argv):
@@ -756,19 +872,31 @@ def main() -> int:
             opts["force"] = True; i += 1; continue
         if a == "--quiet":
             opts["quiet"] = True; i += 1; continue
-        if a == "--pick":
-            opts["pick"] = True; i += 1; continue
+        if a in ("--pick", "--gui"):
+            opts["pick"] = True; opts["gui"] = True
+            i += 1; continue
         if a == "--clipboard":
             opts["clipboard"] = True; i += 1; continue
         files.append(a); i += 1
 
-    limit = int(opts["limit"] * 1_000_000)
+    limit_mb = float(opts["limit"])
+    # GUI invocations without an explicit --limit ask for the target size
+    # first. Direct CLI use (files as arguments) never prompts.
+    if opts["gui"] and not limit_given:
+        chosen = gui_limit(limit_mb)
+        if chosen is None:
+            say("Cancelled.")
+            return 0
+        limit_mb = chosen
+        opts["limit"] = chosen
+
+    limit = int(limit_mb * 1_000_000)
     quiet = opts["quiet"]
     try:
         if opts["clipboard"]:
             inputs = [Path(f) for f in clipboard_pick()]
         else:
-            inputs = collect_inputs(files, opts["pick"])
+            inputs = collect_inputs(files, opts["pick"], limit_mb)
     except RuntimeError as exc:
         print(f"compress10mb: {exc}", file=sys.stderr)
         return 1
@@ -805,7 +933,7 @@ def main() -> int:
             if started:
                 reporter.finish(True, f"{mb(before)} -> {mb(after)}")
             if str(result) != str(src):
-                notify("Compressed to 10 MB",
+                notify(f"Compressed to {size_tag(limit)} MB",
                        f"{src.name}: {mb(before)} -> {mb(after)}\n{result}")
         except Exception as exc:  # noqa: BLE001 - show the real reason
             fail += 1

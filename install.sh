@@ -87,6 +87,7 @@ OPTIONAL_PACKAGES=(
   zsh-history-substring-search
   zsh-theme-powerlevel10k
   syncthing
+  pacman-contrib
 )
 
 # CachyOS-specific defaults that the shell/editor configs source. Only

@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Toggle between the configured English and Bulgarian-phonetic layouts.
+# Hyprland can track several keyboards (including controller virtual keyboards),
+# so read the first real keyboard's state and apply the same layout to all of them.
+set -u
+
+state=$(hyprctl -j devices 2>/dev/null | jq -r '
+  [.keyboards[] | select(.layout == "us,bg")]
+  | .[0].active_layout_index // 0
+')
+
+case "$state" in
+  1|bg|bulgarian) target=0 ;;
+  *) target=1 ;;
+esac
+
+hyprctl switchxkblayout all "$target" >/dev/null 2>&1

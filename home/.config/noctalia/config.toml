@@ -151,7 +151,7 @@ right = "exec pavucontrol"
 [widget.compress10mb]
 type = "custom_button"
 glyph = "file-zip"
-tooltip = "Compress images/videos to under 10 MB"
+tooltip = "Compress images/videos to a chosen size"
 
     [widget.compress10mb.actions]
     left = "exec /home/zxx/.local/bin/compress10mb --pick"

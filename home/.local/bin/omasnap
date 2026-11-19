@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# omasnap launcher: the release binary needs layer-shell-qt, installed here
+# user-locally because this machine has no passwordless sudo.
+base="$HOME/.local/lib/omasnap"
+export LD_LIBRARY_PATH="$base/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export QT_PLUGIN_PATH="$base/plugins${QT_PLUGIN_PATH:+:$QT_PLUGIN_PATH}"
+exec "$base/omasnap" "$@"

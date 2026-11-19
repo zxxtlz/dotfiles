@@ -70,6 +70,8 @@ Optional extras (installed with `./install.sh --optional`):
   `zsh-history-substring-search`, `zsh-theme-powerlevel10k` — zsh setup
 - `librewolf` — my default browser
 - `syncthing` — started from Hyprland autostart
+- `pacman-contrib` — provides `checkupdates`, used by
+  `~/.local/bin/update-count` for the pending-updates badge
 - Swift toolchain + `sourcekit-lsp` — Neovim Swift support (not packaged here)
 - `localsend`, `viber`, `librepods`, Lunar Client — autostart entries in
   `~/.config/hypr/config/autostart.lua`; delete them if unused
@@ -162,13 +164,14 @@ installer (`~/.local/state/dotfiles-backups/`).
 | --- | --- |
 | **Shell** | `~/.bashrc`, `~/.bash_profile`, `~/.bash_logout`, `~/.zshrc`, `~/.config/fish/config.fish` |
 | **Window manager** | `~/.config/hypr/` — Lua-based Hyprland config: binds, animations, monitors, window rules, workspaces, autostart, idle daemon (`hypridle.conf`), and a locally built plugin (`~/.local/lib/hyprland/`) |
+| **Screenshots** | `~/.config/omasnap/`, `~/.local/lib/omasnap/` (native Wayland capture + annotation), plus the legacy `screenshot`/swappy helper |
 | **Terminals** | `~/.config/kitty/`, `~/.config/alacritty/` (incl. Noctalia/wallpaper themes) |
 | **Editor** | `~/.vimrc`, `~/.config/nvim/` (LazyVim), `~/.config/micro/` |
 | **Desktop theme** | `~/.config/gtk-3.0/`, `~/.config/gtk-4.0/`, `~/.config/qt5ct/`, `~/.config/qt6ct/`, `~/.config/nwg-look/`, `kdeglobals`, `xsettingsd`, `mimeapps.list` |
 | **Bars & widgets** | `~/.config/noctalia/`, `~/.config/rofi/`, `~/.config/btop/`, `~/.config/cava/` |
 | **Session / audio** | `~/.config/uwsm/`, `~/.config/wireplumber/`, `~/.config/systemd/user/cliphist-store.service` |
-| **Apps** | `~/.config/swappy/`, `~/.config/qView/`, `~/.config/Thunar/`, `~/.config/kritarc` |
-| **Scripts** | `~/.local/bin/` — screenshot, swappy wrapper, shell-switch, wallpaper-theme, update-all, rofi-shortcuts, compress10mb, session-idle/lock, hypr-plugins, … |
+| **Apps** | `~/.config/swappy/`, `~/.config/omasnap/`, `~/.config/qView/`, `~/.config/Thunar/`, `~/.config/kritarc`, `~/.config/vesktop-flags.conf` |
+| **Scripts** | `~/.local/bin/` — omasnap launcher, screenshot, shell-switch, wallpaper-theme, update-all, update-count, rofi-shortcuts, compress10mb, toggle-layout, session-idle/lock, hypr-plugins, … |
 
 ## Notes
 
@@ -185,5 +188,12 @@ installer (`~/.local/state/dotfiles-backups/`).
   (x86-64) compiled against Hyprland 0.57. If Hyprland refuses to load it
   after a major upgrade, rebuild it or comment out `plugins.lua` and
   `hypr-plugins` in `autostart.lua`; everything else works without it.
+- `~/.local/lib/omasnap/` contains a **prebuilt x86-64 binary** plus its Qt
+  layer-shell library/plugin (the `omasnap-bin` AUR package is an
+  alternative). `~/.local/bin/omasnap` sets `LD_LIBRARY_PATH` and
+  `QT_PLUGIN_PATH` before launching it. Screenshots still work with the
+  older `screenshot`/swappy scripts if you remove the new keybinds.
+- `update-count` writes to `~/.cache/ukishima/` and is read by the
+  **Ukishima** shell, which is not bundled (see "Not included").
 - Neovim uses [LazyVim](https://lazyvim.github.io/); plugins install
   automatically on first launch.

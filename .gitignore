@@ -43,6 +43,7 @@ home/.config/GREYC/
 home/.config/cachyos/
 home/.config/configstore/
 home/.config/hd2arsenal/
+home/.config/etest/
 home/.config/sonora/
 home/.pulse-cookie
 home/.steampath
@@ -51,3 +52,4 @@ home/.viminfo
 home/.local/bin/__pycache__/
 home/.local/bin/*.bak.*
 home/.local/lib/nodejs*/
+home/.local/lib/swift-compat/

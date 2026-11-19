@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Count available package updates for the Ukishima pill badge.
+#
+# Official repos come from checkupdates (pacman-contrib); AUR packages come
+# from `yay -Qua`. The two lists are disjoint, so the sum is the real number of
+# pending upgrades. Results are published atomically for the shell's FileView.
+set -u
+
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/ukishima"
+OUT="$CACHE/update-count.txt"
+LOCK="$CACHE/update-count.lock"
+mkdir -p "$CACHE"
+
+# Never run two checks at once (startup timer + periodic timer can overlap).
+exec 9>"$LOCK"
+flock -n 9 || exit 0
+
+repo=0
+aur=0
+if command -v checkupdates >/dev/null 2>&1; then
+    repo=$(timeout 120 checkupdates 2>/dev/null | grep -c .)
+fi
+if command -v yay >/dev/null 2>&1; then
+    aur=$(timeout 120 yay -Qua 2>/dev/null | grep -c .)
+fi
+
+total=$((repo + aur))
+tmp="$CACHE/update-count.$$.tmp"
+printf '%d\n' "$total" >"$tmp"
+mv -f "$tmp" "$OUT"

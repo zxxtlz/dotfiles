@@ -11,19 +11,19 @@
 
     /* Replace rofi's built-in Solarized palette variables so no default
        light colours leak into alternating rows or mode buttons. */
-    background:                    #3f2118;
+    background:                    #392416;
     foreground:                    #e7e5e4;
-    lightbg:                       #572d21;
-    lightfg:                       #bfb8b5;
+    lightbg:                       #51331f;
+    lightfg:                       #bfb9b5;
     normal-background:             transparent;
     normal-foreground:             #e7e5e4;
     alternate-normal-background:   transparent;
     alternate-normal-foreground:   #e7e5e4;
-    selected-normal-background:    #f19074;
+    selected-normal-background:    #e8a87d;
     selected-normal-foreground:    #111111;
-    active-background:             #572d21;
+    active-background:             #51331f;
     active-foreground:             #e7e5e4;
-    selected-active-background:    #f19074;
+    selected-active-background:    #e8a87d;
     selected-active-foreground:    #111111;
     alternate-active-background:   transparent;
     alternate-active-foreground:   #e7e5e4;
@@ -33,7 +33,7 @@
     selected-urgent-foreground:    #690005;
     alternate-urgent-background:   transparent;
     alternate-urgent-foreground:   #e7e5e4;
-    separatorcolor:                #924c37;
+    separatorcolor:                #8c5835;
 }
 
 window {
@@ -41,9 +41,9 @@ window {
     location:         center;
     anchor:           center;
     border:           1px;
-    border-color:     #f1907466;
+    border-color:     #e8a87d66;
     border-radius:    20px;
-    background-color: #3f2118f7;
+    background-color: #392416f7;
     padding:          16px;
 }
 
@@ -52,9 +52,9 @@ mainbox {
 }
 
 inputbar {
-    background-color: #4d281d;
+    background-color: #472d1b;
     border:           1px;
-    border-color:     #924c37;
+    border-color:     #8c5835;
     border-radius:    14px;
     padding:          14px 18px;
     spacing:          14px;
@@ -62,14 +62,14 @@ inputbar {
 }
 
 prompt {
-    text-color: #f19074;
+    text-color: #e8a87d;
     font:       "Adwaita Sans Bold 13";
 }
 
 entry {
     text-color:         #e7e5e4;
     placeholder:        "Search applications…";
-    placeholder-color:  #918683;
+    placeholder-color:  #918883;
     cursor:             text;
 }
 
@@ -103,14 +103,14 @@ element alternate.urgent {
 
 element normal.active,
 element alternate.active {
-    background-color: #572d21;
+    background-color: #51331f;
     text-color:       #e7e5e4;
 }
 
 element selected.normal,
 element selected.active,
 element selected.urgent {
-    background-color: #f19074;
+    background-color: #e8a87d;
     text-color:       #111111;
 }
 
@@ -129,21 +129,21 @@ mode-switcher {
 }
 
 button {
-    background-color: #4d281d;
-    text-color:       #bfb8b5;
+    background-color: #472d1b;
+    text-color:       #bfb9b5;
     border:           0px;
     border-radius:    10px;
     padding:          9px 14px;
 }
 
 button selected {
-    background-color: #f19074;
+    background-color: #e8a87d;
     text-color:       #111111;
 }
 
 scrollbar {
     width:        6px;
-    handle-color: #924c37;
+    handle-color: #8c5835;
     handle-width: 6px;
 }
 

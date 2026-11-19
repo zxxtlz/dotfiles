@@ -6,6 +6,9 @@ hl.on("hyprland.start", function()
 	-- Start whichever desktop shell was selected last (Noctalia or Ukishima).
 	-- Toggle at runtime with Super+Shift+U, or run: shell-switch toggle
 	hl.exec_cmd("/home/zxx/.local/bin/shell-switch autostart")
+	-- Watchdog: even if a shell is launched directly from a menu, never let
+	-- Noctalia and Ukishima both stay alive. Only the saved selection survives.
+	hl.exec_cmd("setsid -f /home/zxx/.local/bin/shell-switch guard >> /home/zxx/.cache/shell-switch-guard.log 2>&1")
 	-- Hypredging: drag a window to the left/right screen edge and hold to move
 	-- it to the previous/next workspace. Loaded here because a runtime config
 	-- load cannot pull in a new library.
